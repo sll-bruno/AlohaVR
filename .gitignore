@@ -1,0 +1,21 @@
+# Credentials / secrets — never commit these
+serviceAccountKey.json
+signalingSettings.json
+turnServerKey.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Datasets / recordings (this project doesn't record, but just in case)
+*.hdf5
+*.mp4
