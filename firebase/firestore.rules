@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Modo de teste: leitura/escrita aberta para qualquer um, sem autenticação.
+    // Necessário porque o app Unity (WebRTCStreamer.cs / TransitionPassthroughScene.cs)
+    // fala com o Firestore via REST API pública, sem login.
+    // Expira automaticamente — depois disso, ninguém mais consegue ler/escrever
+    // até as regras serem republicadas. Reduz o risco de esquecer isso aberto
+    // pra sempre depois da demo da UPA 2026.
+    match /{document=**} {
+      allow read, write: if request.time < timestamp.date(2026, 8, 23);
+    }
+  }
+}
