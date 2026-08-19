@@ -51,6 +51,7 @@ except ImportError as e:
 # quadrado — mas o app Unity foi feito para a ZED real, 16:9; a imagem quadrada
 # chega esticada e a perspectiva fica errada. Além disso 720x720 x2 é caro.
 EYE_CAMERAS = ("zed_cam_left", "zed_cam_right")
+ARM_LINK_KEYWORDS = ("shoulder", "upper_arm", "forearm", "wrist", "base_link")
 SPECTATOR_CAMERA = "overhead_cam"  # terceira pessoa, pra tela externa
 SPECTATOR_WINDOW_NAME = "AlohaVR — visão do publico"
 
@@ -62,13 +63,55 @@ def send_popup_message(headset: WebRTCHeadset, message: str, duration: float = 3
     time.sleep(duration)
 
 
+def boxify_collision_meshes(model, include_arm_links: bool) -> int:
+    """Troca malhas de colisão pela sua caixa envolvente.
+
+    Colisão malha-malha domina o mj_step (3.25 dos 3.29 ms). O modelo mantém
+    geoms de visual e de colisão separados, então isto não muda nada do que
+    aparece na tela. O `world` são 33 extrusões de alumínio alinhadas aos eixos
+    (a gaiola em volta da bancada): a caixa é quase exata e o corpo é estático,
+    então não afeta manipulação. Os elos dos braços são opcionais: a caixa
+    envolvente de um elo diagonal fica bem maior que o elo e pode gerar colisão
+    falsa, com o braço parecendo travar sem motivo.
+    """
+    mesh_type = int(mujoco.mjtGeom.mjGEOM_MESH)
+    converted = 0
+    for i in range(model.ngeom):
+        if int(model.geom_type[i]) != mesh_type:
+            continue
+        if not (model.geom_contype[i] or model.geom_conaffinity[i]):
+            continue
+        body = mujoco.mj_id2name(
+            model._model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[i])
+        ) or ""
+        is_world = body == "world"
+        is_arm_link = any(k in body for k in ARM_LINK_KEYWORDS) and "gripper" not in body
+        # Os dedos das garras nunca entram aqui: é onde o agarre acontece.
+        if not (is_world or (include_arm_links and is_arm_link)):
+            continue
+
+        mesh_id = int(model.geom_dataid[i])
+        start = int(model.mesh_vertadr[mesh_id])
+        count = int(model.mesh_vertnum[mesh_id])
+        verts = np.array(model.mesh_vert[start:start + count]).reshape(-1, 3)
+        lo, hi = verts.min(axis=0), verts.max(axis=0)
+
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, np.array(model.geom_quat[i]))
+        model.geom_pos[i] = np.array(model.geom_pos[i]) + rot.reshape(3, 3) @ ((lo + hi) / 2)
+        model.geom_size[i][:3] = np.maximum((hi - lo) / 2, 1e-4)
+        model.geom_type[i] = int(mujoco.mjtGeom.mjGEOM_BOX)
+        converted += 1
+    return converted
+
+
 def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
     return env._physics.render(height=height, width=width, camera_id=camera_id)
 
 
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
-             fovy: float, multiccd: bool, substeps: int):
+             fovy: float, multiccd: bool, substeps: int, collision: str):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -101,6 +144,10 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     # ao custo de agarre menos firme (menos pontos por par). --multiccd religa.
     if not multiccd:
         model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
+
+    if collision != "mesh":
+        n = boxify_collision_meshes(model, include_arm_links=(collision == "all"))
+        print(f"colisão: {n} malhas convertidas em caixas (modo '{collision}')")
     n_substeps = sim_env_module.SIM_PHYSICS_ENV_STEP_RATIO
     frame_period = physics_timestep * n_substeps
 
@@ -255,11 +302,15 @@ if __name__ == "__main__":
     parser.add_argument("--eye-height", type=int, default=720, help="Altura de cada olho")
     parser.add_argument("--spectator-every", type=int, default=3,
                         help="Renderiza a janela do público 1 a cada N frames")
-    parser.add_argument("--physics-timestep", type=float, default=0.003,
+    parser.add_argument("--physics-timestep", type=float, default=0.0025,
                         help="Timestep da física. 0.002=fiel mas 0.4x tempo real aqui; "
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--collision", choices=("mesh", "world", "all"), default="world",
+                        help="mesh=original; world=estrutura vira caixas (~21%% mais rápido, "
+                             "sem efeito na manipulação); all=inclui elos dos braços "
+                             "(~35%%, pode causar colisão falsa)")
     parser.add_argument("--substeps", type=int, default=None,
                         help="Substeps de física por frame (padrão 20, do av-aloha). "
                              "Menos substeps com timestep maior = mais rápido, menos fiel")
@@ -268,4 +319,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
-             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps)
+             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision)
