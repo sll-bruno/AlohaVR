@@ -36,7 +36,11 @@ try:
     from webrtc_headset import WebRTCHeadset
     # HeadsetFullControl move os dois braços via VR (não só o braço do meio/cabeça)
     from headset_control import HeadsetFullControl as HeadsetControl
-    from headset_utils import HeadsetFeedback
+    from headset_utils import HeadsetFeedback, convert_right_to_left_coordinates
+    from transform_utils import (
+        align_rotation_to_z_axis, mat2pose, pose2mat, quat2mat,
+        transform_coordinates, within_pose_threshold, wxyz_to_xyzw, xyzw_to_wxyz,
+    )
     from constants import SIM_DT, SIM_PHYSICS_ENV_STEP_RATIO, SIM_TASK_CONFIGS
     from dm_control.rl.control import PhysicsError
 except ImportError as e:
@@ -51,6 +55,102 @@ except ImportError as e:
 # quadrado — mas o app Unity foi feito para a ZED real, 16:9; a imagem quadrada
 # chega esticada e a perspectiva fica errada. Além disso 720x720 x2 é caro.
 EYE_CAMERAS = ("zed_cam_left", "zed_cam_right")
+class AnchoredControl:
+    """Controle em que cada membro é relativo à própria pose no engate.
+
+    O HeadsetFullControl do av-aloha mapeia as mãos relativas à *cabeça*: a
+    posição do controle em relação ao seu crânio vira a posição do braço em
+    relação à câmera do robô. Na prática, engatar com as mãos na cintura joga
+    os braços do robô para baixo na hora. Aqui cada membro guarda seu próprio
+    par (pose sua, pose do robô) no instante do engate, então nada salta: o
+    movimento passa a ser puramente incremental a partir dali.
+    """
+
+    def __init__(self, head_position_threshold=0.05, head_rotation_threshold=0.3):
+        self.head_position_threshold = head_position_threshold
+        self.head_rotation_threshold = head_rotation_threshold
+        self.reset()
+
+    def reset(self):
+        self.started = False
+        self.anchors = {}
+
+    def is_running(self):
+        return self.started
+
+    @staticmethod
+    def _arm_mat(pose):
+        return pose2mat(pose[:3], wxyz_to_xyzw(pose[3:]))
+
+    def start(self, headset_data, left_arm_pose, right_arm_pose, middle_arm_pose):
+        head = np.eye(4)
+        head[:3, :3] = align_rotation_to_z_axis(quat2mat(headset_data.h_quat))
+        head[:3, 3] = headset_data.h_pos
+
+        middle = np.eye(4)
+        middle[:3, :3] = align_rotation_to_z_axis(
+            quat2mat(wxyz_to_xyzw(middle_arm_pose[3:]))
+        )
+        middle[:3, 3] = middle_arm_pose[:3]
+
+        self.anchors = {
+            "middle": (head, middle),
+            "left": (pose2mat(headset_data.l_pos, headset_data.l_quat),
+                     self._arm_mat(left_arm_pose)),
+            "right": (pose2mat(headset_data.r_pos, headset_data.r_quat),
+                      self._arm_mat(right_arm_pose)),
+        }
+        self.started = True
+
+    def run(self, headset_data, left_arm_pose, right_arm_pose, middle_arm_pose):
+        current = {
+            "left": self._arm_mat(left_arm_pose),
+            "right": self._arm_mat(right_arm_pose),
+            "middle": self._arm_mat(middle_arm_pose),
+        }
+        user_now = {
+            "left": pose2mat(headset_data.l_pos, headset_data.l_quat),
+            "right": pose2mat(headset_data.r_pos, headset_data.r_quat),
+            "middle": pose2mat(headset_data.h_pos, headset_data.h_quat),
+        }
+
+        if self.started:
+            targets = {
+                name: transform_coordinates(user_now[name], *self.anchors[name])
+                for name in current
+            }
+            head_ref, middle_ref = self.anchors["middle"]
+        else:
+            # Antes de engatar o robô fica parado: alvo é a pose atual.
+            targets = dict(current)
+            head_ref, middle_ref = np.eye(4), current["middle"]
+
+        parts = []
+        for name, gripper in (("left", headset_data.l_index_trigger),
+                              ("right", headset_data.r_index_trigger)):
+            pos, quat = mat2pose(targets[name])
+            parts += [pos, xyzw_to_wxyz(quat), np.array([gripper])]
+        mid_pos, mid_quat = mat2pose(targets["middle"])
+        parts += [mid_pos, xyzw_to_wxyz(mid_quat)]
+
+        feedback = HeadsetFeedback()
+        feedback.info = ""
+        feedback.head_out_of_sync = not within_pose_threshold(
+            current["middle"][:3, 3], current["middle"][:3, :3],
+            targets["middle"][:3, 3], targets["middle"][:3, :3],
+            self.head_position_threshold, self.head_rotation_threshold,
+        )
+        feedback.left_out_of_sync = False
+        feedback.right_out_of_sync = False
+        for name in ("left", "right", "middle"):
+            in_head_frame = transform_coordinates(current[name], middle_ref, head_ref)
+            pos, quat = convert_right_to_left_coordinates(*mat2pose(in_head_frame))
+            setattr(feedback, f"{name}_arm_position", pos)
+            setattr(feedback, f"{name}_arm_rotation", quat)
+
+        return np.concatenate(parts), feedback
+
+
 ARM_LINK_KEYWORDS = ("shoulder", "upper_arm", "forearm", "wrist", "base_link")
 SPECTATOR_CAMERA = "overhead_cam"  # terceira pessoa, pra tela externa
 SPECTATOR_WINDOW_NAME = "AlohaVR — visão do publico"
@@ -111,7 +211,8 @@ def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
 
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
-             fovy: float, multiccd: bool, substeps: int, collision: str):
+             fovy: float, multiccd: bool, substeps: int, collision: str,
+             anchored: bool):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -135,8 +236,10 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     # velocidade real ao custo de fidelidade do contato.
     model = env._physics.model
     model.opt.timestep = physics_timestep
-    model.opt.iterations = 20
-    model.opt.ls_iterations = 10
+    # Iterações do solver ficam no padrão do MuJoCo (100/50): reduzi-las custava
+    # ~10 ms quando o frame era 105 ms, mas depois das otimizações de colisão o
+    # ganho sumiu no ruído e o contato ficava pior — o bloco saía empurrado a
+    # 0.59 m/s ao ser tocado, contra 0.28 m/s com o solver completo.
 
     # Perfilando o mj_step, 3.25 dos 3.29 ms ficam em colisão narrow-phase: o
     # MULTICCD emite ~5 pontos de contato por par convexo, chegando a ~340
@@ -175,7 +278,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
 
     headset.run_in_thread()
 
-    headset_control = HeadsetControl()
+    headset_control = AnchoredControl() if anchored else HeadsetControl()
     headset_control.reset()
 
     ts, _info = env.reset()
@@ -245,7 +348,13 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 )
 
                 if not headset_control.is_running() and headset_data.r_button_one:
-                    headset_control.start(headset_data, ts["poses"]["middle"])
+                    if anchored:
+                        headset_control.start(
+                            headset_data, ts["poses"]["left"],
+                            ts["poses"]["right"], ts["poses"]["middle"],
+                        )
+                    else:
+                        headset_control.start(headset_data, ts["poses"]["middle"])
 
                 if headset_control.is_running():
                     action = new_action
@@ -307,6 +416,9 @@ if __name__ == "__main__":
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--head-relative-hands", dest="anchored", action="store_false",
+                        help="Volta ao mapeamento do av-aloha: mãos relativas à cabeça "
+                             "(os braços saltam para onde suas mãos estiverem ao engatar)")
     parser.add_argument("--collision", choices=("mesh", "world", "all"), default="world",
                         help="mesh=original; world=estrutura vira caixas (~21%% mais rápido, "
                              "sem efeito na manipulação); all=inclui elos dos braços "
@@ -319,4 +431,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
-             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision)
+             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored)

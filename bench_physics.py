@@ -32,8 +32,10 @@ def main():
     env = make_sim_env("sim_insert_peg", cameras=[])
     model = env._physics.model
     model.opt.timestep = TIMESTEP
-    model.opt.iterations = 20
-    model.opt.ls_iterations = 10
+    # Iterações do solver ficam no padrão do MuJoCo (100/50): reduzi-las custava
+    # ~10 ms quando o frame era 105 ms, mas depois das otimizações de colisão o
+    # ganho sumiu no ruído e o contato ficava pior — o bloco saía empurrado a
+    # 0.59 m/s ao ser tocado, contra 0.28 m/s com o solver completo.
     model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
     converted = boxify_collision_meshes(model, include_arm_links=False)
     print(f"colisão: {converted} malhas estáticas convertidas em caixas")
