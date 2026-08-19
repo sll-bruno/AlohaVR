@@ -12,12 +12,17 @@ Uso (com o venv do av-aloha):
 import platform
 import time
 
+import mujoco
 import numpy as np
 
 from constants import SIM_PHYSICS_ENV_STEP_RATIO
 from sim_env import make_sim_env
 
-TIMESTEP = 0.004  # o mesmo default do run_demo.py
+# Espelha exatamente a configuração do run_demo.py: medir o modelo sem as
+# otimizações daria um número que não corresponde ao que a demo roda.
+from run_demo import boxify_collision_meshes
+
+TIMESTEP = 0.0025
 EYE_W, EYE_H = 1280, 720
 
 
@@ -29,6 +34,9 @@ def main():
     model.opt.timestep = TIMESTEP
     model.opt.iterations = 20
     model.opt.ls_iterations = 10
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
+    converted = boxify_collision_meshes(model, include_arm_links=False)
+    print(f"colisão: {converted} malhas estáticas convertidas em caixas")
 
     obs, _ = env.reset()
     action = np.concatenate([
@@ -59,7 +67,8 @@ def main():
     print(f"frame completo:                        {frame_ms:6.1f} ms -> {1000/frame_ms:.1f} Hz")
     print(f"velocidade vs tempo real:              {sim_ms/frame_ms:.2f}x  (1.0 = tempo real)")
     print()
-    print("referência MacBook Air M-series: ~95 ms física+IK, ~25 ms render, ~9-10 Hz, 0.75x")
+    print("referência MacBook Air M-series (mesma config): ~20 ms física+IK, "
+          "~28 ms render, ~16 Hz ao vivo")
 
 
 if __name__ == "__main__":
