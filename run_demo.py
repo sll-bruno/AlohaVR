@@ -25,6 +25,7 @@ import sys
 import time
 
 import cv2
+import mujoco
 import numpy as np
 
 # Este script roda com av-aloha/data_collection_scripts no PYTHONPATH
@@ -66,7 +67,7 @@ def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
 
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
-             fovy: float):
+             fovy: float, multiccd: bool):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -86,6 +87,13 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     model.opt.timestep = physics_timestep
     model.opt.iterations = 20
     model.opt.ls_iterations = 10
+
+    # Perfilando o mj_step, 3.25 dos 3.29 ms ficam em colisão narrow-phase: o
+    # MULTICCD emite ~5 pontos de contato por par convexo, chegando a ~340
+    # contatos por passo. Desligá-lo cai para ~94 contatos e 2.85x mais rápido,
+    # ao custo de agarre menos firme (menos pontos por par). --multiccd religa.
+    if not multiccd:
+        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
     frame_period = physics_timestep * SIM_PHYSICS_ENV_STEP_RATIO
 
     # fovy é o FOV vertical. Renderizando 16:9 com o fovy=90 do XML, o FOV
@@ -239,12 +247,14 @@ if __name__ == "__main__":
     parser.add_argument("--eye-height", type=int, default=720, help="Altura de cada olho")
     parser.add_argument("--spectator-every", type=int, default=3,
                         help="Renderiza a janela do público 1 a cada N frames")
-    parser.add_argument("--physics-timestep", type=float, default=0.004,
+    parser.add_argument("--physics-timestep", type=float, default=0.003,
                         help="Timestep da física. 0.002=fiel mas 0.4x tempo real aqui; "
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--multiccd", action="store_true",
+                        help="Religa o MULTICCD: agarre mais firme, ~2.8x mais lento")
     args = parser.parse_args()
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
-             args.spectator_every, args.physics_timestep, args.fovy)
+             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd)
