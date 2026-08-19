@@ -36,6 +36,7 @@ try:
     from headset_control import HeadsetFullControl as HeadsetControl
     from headset_utils import HeadsetFeedback
     from constants import SIM_DT, SIM_PHYSICS_ENV_STEP_RATIO, SIM_TASK_CONFIGS
+    from dm_control.rl.control import PhysicsError
 except ImportError as e:
     sys.exit(
         "Não consegui importar os módulos do av-aloha. Rode este script a partir\n"
@@ -135,7 +136,22 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
         while True:
             step_start = time.time()
 
-            ts, _reward, terminated, _truncated, info = env.step(action)
+            # Timestep maior que o padrão troca fidelidade por velocidade e pode
+            # divergir sob contato (mjWARN_BADQACC). Numa demo ao vivo isso não
+            # pode derrubar o processo: reseta a cena e segue.
+            try:
+                ts, _reward, terminated, _truncated, info = env.step(action)
+            except PhysicsError:
+                print("[sim] física divergiu, resetando a cena...")
+                send_popup_message(headset, "Simulação instável. Reiniciando a cena...", 1.5)
+                ts, _info = env.reset()
+                action = np.concatenate([
+                    ts["poses"]["left"], np.array([0.0]),
+                    ts["poses"]["right"], np.array([0.0]),
+                    ts["poses"]["middle"],
+                ])
+                headset_control.reset()
+                continue
 
             if terminated:
                 send_popup_message(headset, f"Simulação terminou: {info}. Reiniciando...", 2.0)
@@ -218,16 +234,16 @@ if __name__ == "__main__":
         "--no-spectator-window", dest="spectator", action="store_false",
         help="Desativa a janela de terceira pessoa (tela do público)",
     )
-    parser.add_argument("--eye-width", type=int, default=640,
-                        help="Largura de cada olho (padrão 640, 16:9 com 360)")
-    parser.add_argument("--eye-height", type=int, default=360, help="Altura de cada olho")
+    parser.add_argument("--eye-width", type=int, default=1280,
+                        help="Largura de cada olho (padrão 1280 = resolução nativa do painel do app)")
+    parser.add_argument("--eye-height", type=int, default=720, help="Altura de cada olho")
     parser.add_argument("--spectator-every", type=int, default=3,
                         help="Renderiza a janela do público 1 a cada N frames")
-    parser.add_argument("--physics-timestep", type=float, default=0.005,
-                        help="Timestep da física (0.002=fiel porém câmera lenta aqui; "
-                             "0.005=tempo real)")
-    parser.add_argument("--fovy", type=float, default=59.0,
-                        help="FOV vertical das câmeras dos olhos (59 ~= 90° horizontal em 16:9)")
+    parser.add_argument("--physics-timestep", type=float, default=0.004,
+                        help="Timestep da física. 0.002=fiel mas 0.4x tempo real aqui; "
+                             "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
+    parser.add_argument("--fovy", type=float, default=52.0,
+                        help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
     args = parser.parse_args()
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
