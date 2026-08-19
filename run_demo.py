@@ -31,6 +31,7 @@ import numpy as np
 # Este script roda com av-aloha/data_collection_scripts no PYTHONPATH
 # (ou a partir de dentro dessa pasta — ver docstring acima).
 try:
+    import sim_env as sim_env_module
     from sim_env import make_sim_env
     from webrtc_headset import WebRTCHeadset
     # HeadsetFullControl move os dois braços via VR (não só o braço do meio/cabeça)
@@ -67,12 +68,18 @@ def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
 
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
-             fovy: float, multiccd: bool):
+             fovy: float, multiccd: bool, substeps: int):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
             f"Opções: {list(SIM_TASK_CONFIGS.keys())}"
         )
+
+    # Substeps por frame: menos substeps com timestep maior cobre o mesmo tempo
+    # simulado por menos CPU, ao custo de fidelidade de contato. sim_env.step lê
+    # esta constante do módulo, por isso a troca é feita aqui.
+    if substeps is not None:
+        sim_env_module.SIM_PHYSICS_ENV_STEP_RATIO = substeps
 
     # cameras=[] : get_obs() não renderiza nada, nós cuidamos disso no loop.
     print(f"Carregando ambiente '{task_name}'...")
@@ -94,7 +101,8 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     # ao custo de agarre menos firme (menos pontos por par). --multiccd religa.
     if not multiccd:
         model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
-    frame_period = physics_timestep * SIM_PHYSICS_ENV_STEP_RATIO
+    n_substeps = sim_env_module.SIM_PHYSICS_ENV_STEP_RATIO
+    frame_period = physics_timestep * n_substeps
 
     # fovy é o FOV vertical. Renderizando 16:9 com o fovy=90 do XML, o FOV
     # horizontal viraria ~121° (grande-angular, imagem "esticada"). ~59° vertical
@@ -102,7 +110,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     for cam in EYE_CAMERAS:
         model.cam_fovy[model.name2id(cam, "camera")] = fovy
 
-    print(f"física: timestep={physics_timestep}s x {SIM_PHYSICS_ENV_STEP_RATIO} substeps "
+    print(f"física: timestep={physics_timestep}s x {n_substeps} substeps "
           f"-> {frame_period*1000:.0f} ms simulados por frame | olhos {eye_width}x{eye_height} fovy={fovy}")
 
     print("Iniciando WebRTC (aguardando conexão do Quest via Firestore)...")
@@ -252,9 +260,12 @@ if __name__ == "__main__":
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--substeps", type=int, default=None,
+                        help="Substeps de física por frame (padrão 20, do av-aloha). "
+                             "Menos substeps com timestep maior = mais rápido, menos fiel")
     parser.add_argument("--multiccd", action="store_true",
                         help="Religa o MULTICCD: agarre mais firme, ~2.8x mais lento")
     args = parser.parse_args()
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
-             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd)
+             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps)
