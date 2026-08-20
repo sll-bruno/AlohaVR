@@ -20,6 +20,7 @@ Uso:
 """
 
 import argparse
+import asyncio
 import os
 import sys
 import time
@@ -60,7 +61,23 @@ ARM_LINK_KEYWORDS = ("shoulder", "upper_arm", "forearm", "wrist", "base_link")
 # robô girar conforme quem está de headset move a própria cabeça — que é o ponto
 # do projeto (visão ativa) e some numa vista de cima.
 SPECTATOR_CAMERAS = ("collaborator_pov", "teleoperator_pov", "overhead_cam", "worms_eye_cam")
-SPECTATOR_WINDOW_NAME = "AlohaVR — visão do publico"
+SPECTATOR_WINDOW_NAME = "AlohaVR"
+
+# Mostrado dentro do headset e na tela do público. O público é de ensino médio e
+# ninguém vai explicar dentro do óculos, então cada cena precisa dizer o que
+# fazer em uma linha, sem jargão.
+TASK_INSTRUCTIONS = {
+    "sim_insert_peg": "Encaixe a peça vermelha no bloco azul",
+    "sim_slot_insertion": "Encaixe o bastão verde na fenda rosa",
+    "sim_sew_needle": "Passe a agulha verde pelo furo da parede",
+    "sim_tube_transfer": "Leve a bolinha de um tubo para o outro",
+    "sim_hook_package": "Pendure a caixa vermelha no gancho",
+}
+FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+)
 
 
 class AnchoredControl:
@@ -159,6 +176,106 @@ class AnchoredControl:
         return np.concatenate(parts), feedback
 
 
+def neutral_action(ts) -> np.ndarray:
+    """Ação que mantém cada braço onde está (garras abertas)."""
+    return np.concatenate([
+        ts["poses"]["left"], np.array([0.0]),
+        ts["poses"]["right"], np.array([0.0]),
+        ts["poses"]["middle"],
+    ])
+
+
+def reset_scene(env, headset_control):
+    ts, _info = env.reset()
+    headset_control.reset()
+    return ts, neutral_action(ts)
+
+
+class ConnectionWatchdog:
+    """Republica o offer quando o headset cai, para o próximo usuário conectar.
+
+    O WebRTCHeadset do av-aloha só reinicia em iceConnectionState == "closed",
+    que no aiortc acontece basicamente quando *nós* fechamos a conexão. Quando
+    alguém tira o óculos ou o app fecha, o estado vai para "failed"/"disconnected"
+    e o offer nunca volta ao Firestore — que já foi apagado após a primeira
+    conexão. Sem isto, o segundo usuário do dia não conectaria e alguém teria
+    que reiniciar o processo no computador.
+    """
+
+    DEAD_STATES = ("failed", "closed", "disconnected")
+
+    def __init__(self, headset, grace_seconds=5.0):
+        self.headset = headset
+        self.grace_seconds = grace_seconds
+        self.connected = False
+        self.dead_since = None
+        self.last_state = None
+
+    def poll(self) -> bool:
+        """Avança a máquina de estados. True quando um novo usuário conecta."""
+        state = self.headset.pc.connectionState
+        if state != self.last_state:
+            print(f"[webrtc] {state}")
+            self.last_state = state
+
+        if state == "connected":
+            self.dead_since = None
+            if not self.connected:
+                self.connected = True
+                return True
+            return False
+
+        if state in self.DEAD_STATES and self.connected:
+            # Carência: "disconnected" às vezes se recupera sozinho.
+            now = time.time()
+            if self.dead_since is None:
+                self.dead_since = now
+            elif now - self.dead_since >= self.grace_seconds:
+                self.connected = False
+                self.dead_since = None
+                print("[webrtc] headset saiu; republicando offer para o próximo usuário")
+                asyncio.run_coroutine_threadsafe(
+                    self.headset.restart_connection(), self.headset.event_loop
+                )
+        return False
+
+
+class Overlay:
+    """Texto sobre a janela do público. Usa Pillow para acentuar corretamente.
+
+    O OpenCV só desenha fontes Hershey (ASCII), que transformam "peça" em "pe?a"
+    numa tela que o público vai ficar olhando o dia todo.
+    """
+
+    def __init__(self):
+        self.font = self.small = None
+        try:
+            from PIL import ImageFont
+            for path in FONT_CANDIDATES:
+                if os.path.exists(path):
+                    self.font = ImageFont.truetype(path, 26)
+                    self.small = ImageFont.truetype(path, 18)
+                    break
+        except ImportError:
+            pass  # sem Pillow o vídeo continua, só sem legenda
+
+    def draw(self, frame_bgr, instruction: str, status: str, connected: bool):
+        if self.font is None:
+            return frame_bgr
+        from PIL import Image, ImageDraw
+        img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img, "RGBA")
+        w, h = img.size
+
+        draw.rectangle([(0, h - 46), (w, h)], fill=(0, 0, 0, 170))
+        draw.text((14, h - 38), instruction, font=self.font, fill=(255, 255, 255, 255))
+
+        dot = (90, 220, 120) if connected else (235, 170, 60)
+        draw.ellipse([(14, 16), (26, 28)], fill=dot)
+        draw.text((34, 13), status, font=self.small, fill=(235, 235, 235, 255))
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
 def send_popup_message(headset: WebRTCHeadset, message: str, duration: float = 3.0):
     feedback = HeadsetFeedback()
     feedback.info = message
@@ -215,7 +332,7 @@ def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
              fovy: float, multiccd: bool, substeps: int, collision: str,
-             anchored: bool, spectator_camera: str):
+             anchored: bool, spectator_camera: str, idle_reset: float):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -269,35 +386,26 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     print("Iniciando WebRTC (aguardando conexão do Quest via Firestore)...")
     headset = WebRTCHeadset()
 
-    # Diagnóstico de conexão: sem estes logs, uma falha de ICE aparece só como
-    # "tela branca" no headset, sem nenhuma pista do que aconteceu.
-    @headset.pc.on("iceconnectionstatechange")
-    async def _on_ice_state():
-        print(f"[ICE] {headset.pc.iceConnectionState}")
-
-    @headset.pc.on("connectionstatechange")
-    async def _on_conn_state():
-        print(f"[PC] {headset.pc.connectionState}")
-
     headset.run_in_thread()
+
+    # O watchdog também loga as transições de estado: handlers presos ao objeto
+    # pc parariam de disparar depois de um restart, que troca o pc inteiro.
+    watchdog = ConnectionWatchdog(headset)
+    overlay = Overlay()
+    instruction = TASK_INSTRUCTIONS.get(task_name, "Use os controles para mover os braços")
 
     headset_control = AnchoredControl() if anchored else HeadsetControl()
     headset_control.reset()
 
-    ts, _info = env.reset()
-    action = np.concatenate([
-        ts["poses"]["left"],
-        np.array([0.0]),
-        ts["poses"]["right"],
-        np.array([0.0]),
-        ts["poses"]["middle"],
-    ])
+    ts, action = reset_scene(env, headset_control)
     env.step(action)
 
-    print("Pronto. Segure o botão A (RButtonOne) no Quest para engatar o controle.")
+    print(f"Pronto: \"{instruction}\". A engata o controle, B reinicia a cena.")
 
-    remote_sdp_reported = False
     frame_idx = 0
+    reset_pressed = False
+    last_data_at = time.time()
+    scene_is_fresh = True
     fps_frame0 = 0
     fps_t0 = time.time()
 
@@ -311,44 +419,46 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
             try:
                 ts, _reward, terminated, _truncated, info = env.step(action)
             except PhysicsError:
-                print("[sim] física divergiu, resetando a cena...")
-                send_popup_message(headset, "Simulação instável. Reiniciando a cena...", 1.5)
-                ts, _info = env.reset()
-                action = np.concatenate([
-                    ts["poses"]["left"], np.array([0.0]),
-                    ts["poses"]["right"], np.array([0.0]),
-                    ts["poses"]["middle"],
-                ])
-                headset_control.reset()
+                print("[sim] física divergiu, resetando a cena")
+                ts, action = reset_scene(env, headset_control)
+                scene_is_fresh = True
                 continue
 
             if terminated:
-                send_popup_message(headset, f"Simulação terminou: {info}. Reiniciando...", 2.0)
-                ts, _info = env.reset()
-                headset_control.reset()
+                print(f"[sim] cena concluída ({info}), reiniciando")
+                ts, action = reset_scene(env, headset_control)
+                scene_is_fresh = True
                 continue
 
-            if not remote_sdp_reported and headset.pc.remoteDescription is not None:
-                remote_sdp_reported = True
-                cands = [
-                    l for l in headset.pc.remoteDescription.sdp.splitlines()
-                    if l.startswith("a=candidate")
-                ]
-                print(f"[ICE] answer do Quest trouxe {len(cands)} candidato(s):")
-                for c in cands:
-                    print(f"      {c}")
+            # Um novo usuário chegou: entrega a cena limpa, sem depender de
+            # alguém mexer no computador entre um aluno e outro.
+            if watchdog.poll():
+                print("[sessão] novo usuário conectado, cena reiniciada")
+                ts, action = reset_scene(env, headset_control)
+                scene_is_fresh = True
 
             headset_data = headset.receive_data()
             feedback = HeadsetFeedback()
-            feedback.info = "Segure o botão A para engatar o controle."
 
             if headset_data is not None:
+                last_data_at = time.time()
                 new_action, feedback = headset_control.run(
                     headset_data,
                     ts["poses"]["left"],
                     ts["poses"]["right"],
                     ts["poses"]["middle"],
                 )
+
+                # B reinicia a cena. Sem isto, arrumar a bagunça de um aluno
+                # exigiria o monitor ir até o computador entre uma pessoa e outra.
+                if headset_data.r_button_two and not reset_pressed:
+                    print("[sessão] reinício pedido pelo botão B")
+                    ts, action = reset_scene(env, headset_control)
+                    scene_is_fresh = True
+                    reset_pressed = True
+                    headset.send_feedback(feedback)
+                    continue
+                reset_pressed = bool(headset_data.r_button_two)
 
                 if not headset_control.is_running() and headset_data.r_button_one:
                     if anchored:
@@ -361,11 +471,24 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
 
                 if headset_control.is_running():
                     action = new_action
+                    scene_is_fresh = False
 
                 if headset_control.is_running() and not headset_data.r_button_one:
                     # soltou o A: desengata, mantém a última pose
                     headset_control.reset()
+            elif (not scene_is_fresh and idle_reset > 0
+                  and time.time() - last_data_at > idle_reset):
+                # O Quest pausa o app quando ninguém o está usando, então parar de
+                # receber pose é o sinal de que o óculos foi tirado: deixa a cena
+                # pronta para a próxima pessoa.
+                print(f"[sessão] {idle_reset:.0f}s sem uso, cena reiniciada")
+                ts, action = reset_scene(env, headset_control)
+                scene_is_fresh = True
 
+            feedback.info = (
+                instruction if headset_control.is_running()
+                else f"Segure A para começar\n{instruction}"
+            )
             headset.send_feedback(feedback)
 
             # vídeo estéreo pro Quest
@@ -376,7 +499,12 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
             # vídeo de terceira pessoa pro público (mais barato: 1 a cada N frames)
             if show_spectator_window and frame_idx % spectator_every == 0:
                 spectator_frame = cv2.cvtColor(
-                    render(env, spectator_camera, 640, 360), cv2.COLOR_RGB2BGR
+                    render(env, spectator_camera, 960, 540), cv2.COLOR_RGB2BGR
+                )
+                spectator_frame = overlay.draw(
+                    spectator_frame, instruction,
+                    "Óculos conectado" if watchdog.connected else "Aguardando óculos",
+                    watchdog.connected,
                 )
                 cv2.imshow(SPECTATOR_WINDOW_NAME, spectator_frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -419,6 +547,9 @@ if __name__ == "__main__":
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--idle-reset", type=float, default=25.0,
+                        help="Segundos sem receber pose até reiniciar a cena "
+                             "para o próximo usuário (0 desativa)")
     parser.add_argument("--spectator-cam", dest="spectator_camera",
                         choices=SPECTATOR_CAMERAS, default="collaborator_pov",
                         help="Câmera da tela do público")
@@ -438,4 +569,4 @@ if __name__ == "__main__":
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
              args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored,
-             args.spectator_camera)
+             args.spectator_camera, args.idle_reset)

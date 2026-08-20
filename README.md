@@ -146,3 +146,26 @@ Para avaliar outra máquina, rode `bench_physics.py` nela e compare. CPU single-
 ## Licença
 
 MIT — veja [LICENSE](LICENSE). O uso do AV-ALOHA e do av-aloha-unity segue as licenças dos projetos originais.
+
+## Operação no dia do evento
+
+Pensado para grupos rotativos, monitores treinados numa única sessão e ninguém com acesso ao código por perto.
+
+**Para iniciar:** dois cliques em `iniciar-demo.command`. Ele confere o ambiente, mostra as instruções na tela e **reinicia sozinho** se o processo cair.
+
+**Entre um usuário e outro, nada precisa ser feito no computador:**
+
+| Situação | O que acontece |
+|---|---|
+| Novo óculos conecta | Cena reinicia automaticamente |
+| Alguém aperta **B** | Cena reinicia |
+| Óculos sem uso por 25 s (`--idle-reset`) | Cena reinicia |
+| Física diverge | Cena reinicia, processo continua |
+| Óculos desconecta | Offer é republicado; o próximo conecta sozinho |
+
+Esse último item é o mais importante e não é comportamento do projeto original: o `WebRTCHeadset` do av-aloha só se recupera de `iceConnectionState == "closed"`, estado que no aiortc só ocorre quando a conexão é fechada localmente. Quando alguém tira o óculos, o estado vai para `failed`, o offer nunca volta ao Firestore (que já foi apagado após a primeira conexão) e **o usuário seguinte não conseguiria conectar** sem reiniciar o processo. O `ConnectionWatchdog` cobre isso.
+
+**Tela do público:** legenda com a tarefa e um indicador de conexão (amarelo = aguardando óculos, verde = conectado), para o monitor saber o estado sem olhar o terminal.
+
+**Dentro do óculos:** a instrução da tarefa aparece o tempo todo, junto de "Segure A para começar".
+
