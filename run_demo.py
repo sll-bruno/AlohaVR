@@ -59,7 +59,7 @@ ARM_LINK_KEYWORDS = ("shoulder", "upper_arm", "forearm", "wrist", "base_link")
 # Vista frontal: além de enquadrar melhor, é nela que o público vê a cabeça do
 # robô girar conforme quem está de headset move a própria cabeça — que é o ponto
 # do projeto (visão ativa) e some numa vista de cima.
-SPECTATOR_CAMERAS = ("teleoperator_pov", "collaborator_pov", "overhead_cam", "worms_eye_cam")
+SPECTATOR_CAMERAS = ("collaborator_pov", "teleoperator_pov", "overhead_cam", "worms_eye_cam")
 SPECTATOR_WINDOW_NAME = "AlohaVR — visão do publico"
 
 
@@ -420,7 +420,7 @@ if __name__ == "__main__":
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
     parser.add_argument("--spectator-cam", dest="spectator_camera",
-                        choices=SPECTATOR_CAMERAS, default="teleoperator_pov",
+                        choices=SPECTATOR_CAMERAS, default="collaborator_pov",
                         help="Câmera da tela do público")
     parser.add_argument("--head-relative-hands", dest="anchored", action="store_false",
                         help="Volta ao mapeamento do av-aloha: mãos relativas à cabeça "
