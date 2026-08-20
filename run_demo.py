@@ -55,6 +55,14 @@ except ImportError as e:
 # quadrado — mas o app Unity foi feito para a ZED real, 16:9; a imagem quadrada
 # chega esticada e a perspectiva fica errada. Além disso 720x720 x2 é caro.
 EYE_CAMERAS = ("zed_cam_left", "zed_cam_right")
+ARM_LINK_KEYWORDS = ("shoulder", "upper_arm", "forearm", "wrist", "base_link")
+# Vista frontal: além de enquadrar melhor, é nela que o público vê a cabeça do
+# robô girar conforme quem está de headset move a própria cabeça — que é o ponto
+# do projeto (visão ativa) e some numa vista de cima.
+SPECTATOR_CAMERAS = ("teleoperator_pov", "collaborator_pov", "overhead_cam", "worms_eye_cam")
+SPECTATOR_WINDOW_NAME = "AlohaVR — visão do publico"
+
+
 class AnchoredControl:
     """Controle em que cada membro é relativo à própria pose no engate.
 
@@ -151,11 +159,6 @@ class AnchoredControl:
         return np.concatenate(parts), feedback
 
 
-ARM_LINK_KEYWORDS = ("shoulder", "upper_arm", "forearm", "wrist", "base_link")
-SPECTATOR_CAMERA = "overhead_cam"  # terceira pessoa, pra tela externa
-SPECTATOR_WINDOW_NAME = "AlohaVR — visão do publico"
-
-
 def send_popup_message(headset: WebRTCHeadset, message: str, duration: float = 3.0):
     feedback = HeadsetFeedback()
     feedback.info = message
@@ -212,7 +215,7 @@ def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
              fovy: float, multiccd: bool, substeps: int, collision: str,
-             anchored: bool):
+             anchored: bool, spectator_camera: str):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -373,7 +376,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
             # vídeo de terceira pessoa pro público (mais barato: 1 a cada N frames)
             if show_spectator_window and frame_idx % spectator_every == 0:
                 spectator_frame = cv2.cvtColor(
-                    render(env, SPECTATOR_CAMERA, 640, 360), cv2.COLOR_RGB2BGR
+                    render(env, spectator_camera, 640, 360), cv2.COLOR_RGB2BGR
                 )
                 cv2.imshow(SPECTATOR_WINDOW_NAME, spectator_frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -416,6 +419,9 @@ if __name__ == "__main__":
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--spectator-cam", dest="spectator_camera",
+                        choices=SPECTATOR_CAMERAS, default="teleoperator_pov",
+                        help="Câmera da tela do público")
     parser.add_argument("--head-relative-hands", dest="anchored", action="store_false",
                         help="Volta ao mapeamento do av-aloha: mãos relativas à cabeça "
                              "(os braços saltam para onde suas mãos estiverem ao engatar)")
@@ -431,4 +437,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
-             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored)
+             args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored,
+             args.spectator_camera)
