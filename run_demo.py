@@ -22,7 +22,9 @@ Uso:
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -73,6 +75,42 @@ TASK_INSTRUCTIONS = {
     "sim_tube_transfer": "Leve a bolinha de um tubo para o outro",
     "sim_hook_package": "Pendure a caixa vermelha no gancho",
 }
+# Par de geoms que se tocam quando a tarefa é concluída. NÃO dá para usar o
+# get_reward() do av-aloha: os marcadores têm gap="100", o que faz o MuJoCo
+# listar contatos a até 100 metros (medido: pin <-> geom a 11 m), e o
+# get_reward() só checa se o par aparece na lista, sem olhar distância — ele
+# retorna "sucesso" com a peça a 26 cm do furo. Aqui filtramos por penetração
+# real (dist < 0).
+# "pair" confirma alinhamento lateral (a peça está dentro do furo); "seat"
+# exige profundidade. Sem o segundo, encostar a ponta já contava como sucesso:
+# o contato reporta sempre -2 cm, que é a penetração lateral, não o quanto
+# entrou — a profundidade só sai da geometria dos corpos.
+# O `pin` do insert_peg tem a MESMA seção da peça (2x2 cm) e fica atravessado no
+# meio do tubo: medido, a peça começa a penetrá-lo a 2 cm de profundidade e trava
+# ali. Ele deveria ser só sensor (gap="100" no XML), mas na prática barra. Por
+# isso a colisão dele é desligada e o sucesso passa a sair da geometria dos
+# corpos, sem depender de contato nenhum.
+SUCCESS_SPECS = {
+    "sim_insert_peg": {
+        "geometric": {"moving": "peg", "socket": "hole",
+                      "max_offset": 0.05, "max_lateral": 0.02},
+        "disable_markers": ("pin",),
+    },
+    "sim_sew_needle": {"pair": ("pin-needle", "pin-wall")},
+}
+# afplay e os sons são nativos do macOS: nada para instalar nem versionar.
+# O áudio sai só nas caixas do Mac — o app Unity ignora tracks que não sejam
+# de vídeo (OnTrack filtra TrackKind.Video), então não há como levá-lo ao
+# headset sem recompilar o APK. Serve de sinal para a plateia e o monitor.
+SUCCESS_SOUND = "/System/Library/Sounds/Hero.aiff"
+CONTROL_TABLE_HEADERS = ("Controle", "Ação")
+CONTROL_TABLE_ROWS = (
+    ("Segure A", "assumir o controle do robô"),
+    ("Gatilhos", "abrir e fechar as garras"),
+    ("Segure X", "recomeçar do zero"),
+    ("B", "voltar à tela inicial"),
+)
+SUCCESS_MESSAGE = "Parabéns! Você concluiu a tarefa"
 FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/Library/Fonts/Arial Unicode.ttf",
@@ -91,9 +129,15 @@ class AnchoredControl:
     movimento passa a ser puramente incremental a partir dali.
     """
 
-    def __init__(self, head_position_threshold=0.05, head_rotation_threshold=0.3):
+    def __init__(self, head_position_threshold=0.05, head_rotation_threshold=0.3,
+                 motion_scale=1.0):
         self.head_position_threshold = head_position_threshold
         self.head_rotation_threshold = head_rotation_threshold
+        # Amplia o deslocamento das mãos (não o da cabeça, que precisa ser 1:1
+        # para a imagem não brigar com o sistema vestibular). Com 1.5, mover a
+        # mão 10 cm move o braço 15 cm: cobre mais espaço de trabalho sem exigir
+        # que a pessoa estique tanto o braço, ao custo de precisão fina.
+        self.motion_scale = motion_scale
         self.reset()
 
     def reset(self):
@@ -140,10 +184,15 @@ class AnchoredControl:
         }
 
         if self.started:
-            targets = {
-                name: transform_coordinates(user_now[name], *self.anchors[name])
-                for name in current
-            }
+            targets = {}
+            for name in current:
+                user_start, arm_start = self.anchors[name]
+                alvo = transform_coordinates(user_now[name], user_start, arm_start)
+                if name != "middle" and self.motion_scale != 1.0:
+                    deslocamento = alvo[:3, 3] - arm_start[:3, 3]
+                    alvo = alvo.copy()
+                    alvo[:3, 3] = arm_start[:3, 3] + deslocamento * self.motion_scale
+                targets[name] = alvo
             head_ref, middle_ref = self.anchors["middle"]
         else:
             # Antes de engatar o robô fica parado: alvo é a pose atual.
@@ -174,6 +223,56 @@ class AnchoredControl:
             setattr(feedback, f"{name}_arm_rotation", quat)
 
         return np.concatenate(parts), feedback
+
+
+def widen_peg_hole(model, margin: float) -> bool:
+    """Afasta as quatro placas que formam o tubo da cena sim_insert_peg.
+
+    A abertura é de 3,6 x 3,6 cm para uma peça de 2 x 2 cm — 8 mm de folga por
+    lado. Acertar 8 mm com a latência da demo, segurando os dois objetos no ar,
+    é o que trava quem tem dois minutos: as garras chegam perto e a peça não
+    entra. Só as placas se movem; o `pin`, que marca o sucesso, fica no centro
+    e não é tocado.
+    """
+    # (geom, eixo em que se afasta, sentido, eixo em que precisa crescer)
+    placas = (("hole-1", 2, -1, 1), ("hole-2", 2, +1, 1),   # piso e teto
+              ("hole-3", 1, +1, 2), ("hole-4", 1, -1, 2))   # laterais
+    try:
+        ids = {n: model.name2id(n, "geom") for n, _, _, _ in placas}
+    except Exception:
+        return False
+    for nome, eixo, sentido, eixo_cresce in placas:
+        i = ids[nome]
+        pos = np.array(model.geom_pos[i])
+        size = np.array(model.geom_size[i])
+        pos[eixo] += sentido * margin
+        # As placas se encostavam exatamente nos cantos; afastá-las sem crescer
+        # abre uma fenda visível do tamanho da margem. Crescer na direção
+        # perpendicular mantém o tubo fechado.
+        size[eixo_cresce] += margin
+        model.geom_pos[i], model.geom_size[i] = pos, size
+    return True
+
+
+def set_socket_mass(model, body_name: str, grams: float) -> bool:
+    """Ajusta a massa do alvo do encaixe.
+
+    O bloco azul tem 101 g de origem contra 48 g da peça: encostar nele o
+    empurra, e a pessoa passa a perseguir um alvo móvel enquanto mira. Pesar
+    mais o deixa firme na mesa — mas peso demais faz a cena parecer travada,
+    então é um número para calibrar, não para maximizar.
+    """
+    try:
+        body = model.name2id(body_name, "body")
+    except Exception:
+        return False
+    atual = float(model.body_mass[body])
+    if atual <= 0:
+        return False
+    alvo = grams / 1000.0
+    model.body_inertia[body] = np.array(model.body_inertia[body]) * (alvo / atual)
+    model.body_mass[body] = alvo
+    return True
 
 
 def widen_needle_hole(model, margin: float) -> bool:
@@ -221,6 +320,277 @@ def widen_needle_hole(model, margin: float) -> bool:
     return True
 
 
+# Ponto do mundo onde o texto é "pintado", atrás da bancada. Fixo no mundo:
+# um texto colado na tela acompanha a cabeça enquanto a cena se move, e esse
+# conflito é justamente o que embrulha o estômago em VR.
+# z escolhido por medição: a 0.42 o texto sai pelo topo assim que a pessoa
+# inclina a cabeça para a mesa — que é a postura natural ao manipular. A 0.28
+# ele fica entre 13% e 25% da altura do quadro nas duas posturas.
+WORLD_TEXT_ANCHOR = np.array([0.0, 0.36, 0.28])
+# A rodinha fica logo acima da mensagem, no mesmo plano do mundo. 7 cm por
+# medição: abaixo disso o anel encosta no texto (a 5 cm sobram 6 px).
+WORLD_RING_ANCHOR = WORLD_TEXT_ANCHOR + np.array([0.0, 0.0, 0.07])
+WORLD_RING_RADIUS = 0.045   # raio físico, em metros
+WORLD_TEXT_HEIGHT = 0.055   # altura física do texto, em metros
+
+
+def project_to_eye(model, data, cam_name, point, width, height):
+    """Projeta um ponto do mundo no pixel correspondente de uma câmera.
+
+    Como cada olho tem posição própria, o mesmo ponto cai em pixels diferentes
+    nos dois — é essa disparidade que faz o texto parecer estar de fato lá no
+    fundo, e não colado no rosto.
+    """
+    cam_id = model.name2id(cam_name, "camera")
+    origin = np.array(data.cam_xpos[cam_id])
+    rot = np.array(data.cam_xmat[cam_id]).reshape(3, 3)
+    local = rot.T @ (np.asarray(point, dtype=float) - origin)
+    depth = -local[2]           # a câmera do MuJoCo olha para -Z
+    if depth <= 0.05:
+        return None             # atrás da câmera ou colado nela
+    focal = (height / 2) / np.tan(np.radians(float(model.cam_fovy[cam_id])) / 2)
+    return (int(width / 2 + focal * local[0] / depth),
+            int(height / 2 - focal * local[1] / depth),
+            depth, focal)
+
+
+def draw_hold_ring(frame, progress: float, center=None, radius=None):
+    """Arco de progresso do gesto de segurar X.
+
+    Sem isto o gesto é invisível: quem segura não tem sinal de que está
+    acontecendo algo e conclui que o botão não funciona. Recebe centro e raio já
+    projetados para ficar ancorado no mundo, junto da mensagem fixa — preso à
+    tela ele acompanharia a cabeça, que é o que embrulha o estômago.
+    """
+    h, w = frame.shape[:2]
+    if center is None:
+        center = (w // 2, h // 2)
+    if radius is None:
+        radius = int(min(h, w) * 0.09)
+    center = (int(center[0]), int(center[1]))
+    radius = max(6, int(radius))
+    cv2.circle(frame, center, radius, (60, 60, 60), 6, cv2.LINE_AA)
+    cv2.ellipse(frame, center, (radius, radius), -90, 0,
+                360 * max(0.0, min(1.0, progress)), (90, 220, 120), 6, cv2.LINE_AA)
+    return frame
+
+
+class HeadsetText:
+    """Texto acentuado dentro do headset, via sprite em cache.
+
+    O cv2.putText só desenha ASCII ("peça" vira "pe?a") e converter o frame
+    inteiro para PIL a cada frame, nos dois olhos, sairia caro. Aqui o texto é
+    rasterizado uma vez por conteúdo e depois só composto sobre a imagem, que é
+    uma operação de numpy.
+    """
+
+    def __init__(self):
+        self.font = None
+        self._cache = {}
+        try:
+            from PIL import ImageFont
+            for path in FONT_CANDIDATES:
+                if os.path.exists(path):
+                    self.font = ImageFont.truetype(path, 22)
+                    break
+        except ImportError:
+            pass
+
+    def _sprite(self, lines, color=None):
+        key = (tuple(lines), color)
+        if key in self._cache:
+            return self._cache[key]
+        from PIL import Image, ImageDraw
+        pad, line_h = 14, 30
+        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        width = max(int(probe.textlength(t, font=self.font)) for t in lines) + 2 * pad
+        height = line_h * len(lines) + 2 * pad
+        img = Image.new("RGBA", (width, height), color or (0, 0, 0, 150))
+        draw = ImageDraw.Draw(img)
+        for i, text in enumerate(lines):
+            tw = int(probe.textlength(text, font=self.font))
+            draw.text(((width - tw) // 2, pad + i * line_h), text,
+                      font=self.font, fill=(255, 255, 255, 255))
+        sprite = np.array(img)
+        if len(self._cache) > 24:       # textos com contagem regressiva mudam muito
+            self._cache.clear()
+        self._cache[key] = sprite
+        return sprite
+
+    def table_sprite(self, headers, rows):
+        """Cartão de controles em duas colunas, com cabeçalho."""
+        key = ("__tabela__", headers, rows)
+        if key in self._cache:
+            return self._cache[key]
+        from PIL import Image, ImageDraw
+        pad, line_h, col_gap = 22, 34, 34
+        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        col1 = max(int(probe.textlength(t, font=self.font))
+                   for t in (headers[0], *(r[0] for r in rows)))
+        col2 = max(int(probe.textlength(t, font=self.font))
+                   for t in (headers[1], *(r[1] for r in rows)))
+        width = col1 + col_gap + col2 + 2 * pad
+        height = line_h * (len(rows) + 1) + 2 * pad + 10
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 165))
+        draw = ImageDraw.Draw(img)
+        draw.text((pad, pad), headers[0], font=self.font, fill=(150, 200, 255, 255))
+        draw.text((pad + col1 + col_gap, pad), headers[1], font=self.font,
+                  fill=(150, 200, 255, 255))
+        rule_y = pad + line_h - 6
+        draw.line([(pad, rule_y), (width - pad, rule_y)], fill=(120, 120, 120, 200))
+        for i, (controle, acao) in enumerate(rows):
+            y = pad + line_h * (i + 1) + 6
+            draw.text((pad, y), controle, font=self.font, fill=(255, 255, 255, 255))
+            draw.text((pad + col1 + col_gap, y), acao, font=self.font,
+                      fill=(235, 235, 235, 255))
+        sprite = np.array(img)
+        self._cache[key] = sprite
+        return sprite
+
+    def blit(self, frame, sprite, cx, cy, scale=1.0):
+        """Compõe um sprite centrado em (cx, cy), recortando o que sair da imagem."""
+        if scale != 1.0:
+            sh = max(1, int(sprite.shape[0] * scale))
+            sw = max(1, int(sprite.shape[1] * scale))
+            sprite = cv2.resize(sprite, (sw, sh), interpolation=cv2.INTER_AREA)
+        sh, sw = sprite.shape[:2]
+        h, w = frame.shape[:2]
+        x0, y0 = int(cx - sw / 2), int(cy - sh / 2)
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        x0, y0 = max(0, x0), max(0, y0)
+        sx1 = min(sw, sx0 + w - x0)
+        sy1 = min(sh, sy0 + h - y0)
+        if sx1 <= sx0 or sy1 <= sy0:
+            return frame
+        piece = sprite[sy0:sy1, sx0:sx1]
+        alpha = piece[:, :, 3:4].astype(np.float32) / 255.0
+        region = frame[y0:y0 + piece.shape[0], x0:x0 + piece.shape[1]]
+        frame[y0:y0 + piece.shape[0], x0:x0 + piece.shape[1]] = (
+            region * (1 - alpha) + piece[:, :, 2::-1] * alpha
+        ).astype(frame.dtype)
+        return frame
+
+    def draw_in_world(self, frame, model, data, cam_name, lines, point,
+                      world_height=WORLD_TEXT_HEIGHT, color=None):
+        """Texto ancorado num ponto do mundo, com perspectiva e paralaxe."""
+        if self.font is None or not lines:
+            return frame
+        h, w = frame.shape[:2]
+        proj = project_to_eye(model, data, cam_name, point, w, h)
+        if proj is None:
+            return frame
+        cx, cy, depth, focal = proj
+        sprite = self._sprite(tuple(lines), color)
+        alvo_px = focal * world_height * len(lines) / depth
+        return self.blit(frame, sprite, cx, cy, alvo_px / sprite.shape[0])
+
+    def draw(self, frame, lines, at_center=False, y_offset=0, color=None):
+        """Faixa inferior para o permanente, centro para o transitório.
+
+        O painel do app ocupa 81,9° x 52°, então o extremo da imagem é
+        desconfortável de ler — nada encostado na borda.
+        """
+        if self.font is None or not lines:
+            return frame
+        sprite = self._sprite(tuple(lines), color)
+        sh, sw = sprite.shape[:2]
+        h, w = frame.shape[:2]
+        x = (w - sw) // 2
+        # 14% da borda: no headset o extremo do painel cai na periferia da
+        # visão, onde ler cansa. Longe da borda, e menor, lê-se melhor.
+        y = ((h - sh) // 2 if at_center else h - sh - int(h * 0.14)) + y_offset
+        if x < 0 or y < 0 or y + sh > h or x + sw > w:
+            return frame
+        alpha = sprite[:, :, 3:4].astype(np.float32) / 255.0
+        region = frame[y:y + sh, x:x + sw]
+        frame[y:y + sh, x:x + sw] = (
+            region * (1 - alpha) + sprite[:, :, 2::-1] * alpha
+        ).astype(frame.dtype)
+        return frame
+
+
+def disable_marker_collision(model, names) -> int:
+    """Tira os marcadores de sucesso do caminho da física."""
+    desligados = 0
+    for nome in names:
+        try:
+            i = model.name2id(nome, "geom")
+        except Exception:
+            continue
+        model.geom_contype[i] = 0
+        model.geom_conaffinity[i] = 0
+        desligados += 1
+    return desligados
+
+
+def task_completed(physics, spec) -> bool:
+    """True quando a tarefa foi concluída de verdade, não só encostada."""
+    if not spec:
+        return False
+    data, model = physics.data, physics.model
+
+    geo = spec.get("geometric")
+    if geo is not None:
+        # Sem contato: a peça está encaixada quando o eixo dela coincide com o
+        # do encaixe (alinhamento) e os centros estão próximos (profundidade).
+        named = physics.named.data
+        centro = np.array(named.xpos[geo["socket"]])
+        eixo = np.array(named.xmat[geo["socket"]]).reshape(3, 3)[:, 0]
+        delta = np.array(named.xpos[geo["moving"]]) - centro
+        ao_longo = float(np.dot(delta, eixo))
+        lateral = float(np.linalg.norm(delta - ao_longo * eixo))
+        return (abs(ao_longo) <= geo["max_offset"]
+                and lateral <= geo["max_lateral"])
+
+    alvo = set(spec["pair"])
+    tocando = False
+    for i in range(data.ncon):
+        contact = data.contact[i]
+        if contact.dist >= 0:
+            continue
+        names = {
+            mujoco.mj_id2name(model._model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom1)),
+            mujoco.mj_id2name(model._model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom2)),
+        }
+        if names == alvo:
+            tocando = True
+            break
+    if not tocando:
+        return False
+
+    seat = spec.get("seat")
+    if seat is None:
+        return True
+    # Quanto a peça avançou pelo eixo do furo: a diferença entre os centros,
+    # projetada no eixo do encaixe. Perto de zero = assentada até o fundo.
+    named = physics.named.data
+    encaixe = np.array(named.xpos[seat["socket"]])
+    eixo = np.array(named.xmat[seat["socket"]]).reshape(3, 3)[:, 0]
+    desvio = abs(float(np.dot(np.array(named.xpos[seat["moving"]]) - encaixe, eixo)))
+    return desvio <= seat["max_offset"]
+
+
+def play_success_sound():
+    """Toca o som de comemoração fora do caminho do frame.
+
+    Medido: subprocess.Popen custa ~10 ms neste processo, o que é 20% de um
+    frame e aparece como engasgo bem no momento da comemoração. Numa thread,
+    o loop nem percebe.
+    """
+    if not os.path.exists(SUCCESS_SOUND):
+        return
+
+    def tocar():
+        try:
+            subprocess.run(["afplay", SUCCESS_SOUND],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False)
+        except OSError:
+            pass  # sem áudio a demo continua igual
+
+    threading.Thread(target=tocar, daemon=True).start()
+
+
 def neutral_action(ts) -> np.ndarray:
     """Ação que mantém cada braço onde está (garras abertas)."""
     return np.concatenate([
@@ -257,14 +627,16 @@ class ConnectionWatchdog:
 
     DEAD_STATES = ("failed", "closed", "disconnected")
 
-    def __init__(self, headset, grace_seconds=8.0):
+    def __init__(self, headset, grace_seconds=8.0, stuck_seconds=12.0):
         self.headset = headset
         self.grace_seconds = grace_seconds
+        self.stuck_seconds = stuck_seconds
         self.connected = False
         self.dead_since = None
         self.pc_when_dead = None
         self.last_state = None
         self.last_pc = headset.pc
+        self.answered_since = None
 
     def poll(self) -> bool:
         """Avança a máquina de estados. True quando um novo usuário conecta."""
@@ -282,6 +654,7 @@ class ConnectionWatchdog:
             self.connected = False
             self.dead_since = None
             self.pc_when_dead = None
+            self.answered_since = None
             self.last_state = None  # reimprime o estado do novo pc
 
         state = pc.connectionState
@@ -292,9 +665,32 @@ class ConnectionWatchdog:
         if state == "connected":
             self.dead_since = None
             self.pc_when_dead = None
+            self.answered_since = None
             if not self.connected:
                 self.connected = True
                 return True
+            return False
+
+        # Conexão que nunca completa: o app consumiu o offer (o run_offer só
+        # segue adiante depois de receber a answer, e aí apaga o documento do
+        # Firestore), mas o ICE não fecha. Nada republica, e o Load no headset
+        # deixa de listar qualquer robô — visto ao vivo, e sem saída para quem
+        # não pode reiniciar o processo no terminal.
+        #
+        # remoteDescription é o discriminador: em repouso, esperando o primeiro
+        # usuário do dia, ele é None e o offer está corretamente parado no
+        # Firestore. Só depois de uma answer consumida faz sentido cobrar prazo.
+        if not self.connected and pc.remoteDescription is not None:
+            now = time.time()
+            if self.answered_since is None:
+                self.answered_since = now
+            elif now - self.answered_since >= self.stuck_seconds:
+                self.answered_since = None
+                print(f"[webrtc] preso em '{state}' após a answer; "
+                      "republicando offer")
+                asyncio.run_coroutine_threadsafe(
+                    self.headset.restart_connection(), self.headset.event_loop
+                )
             return False
 
         if state in self.DEAD_STATES and self.connected:
@@ -346,7 +742,13 @@ class Overlay:
         except ImportError:
             pass  # sem Pillow o vídeo continua, só sem legenda
 
-    def draw(self, frame_bgr, instruction: str, status: str, connected: bool):
+    def draw(self, frame_bgr, instruction: str, status: str, connected: bool,
+             completions: int = 0, celebrating: bool = False, slow: bool = False):
+        """O centro fica livre durante o uso — é onde o público olha o robô.
+
+        Só é ocupado quando não há nada acontecendo (ninguém conectado) ou
+        quando há algo a comemorar.
+        """
         if self.font is None:
             return frame_bgr
         from PIL import Image, ImageDraw
@@ -360,7 +762,33 @@ class Overlay:
         dot = (90, 220, 120) if connected else (235, 170, 60)
         draw.ellipse([(14, 16), (26, 28)], fill=dot)
         draw.text((34, 13), status, font=self.small, fill=(235, 235, 235, 255))
+
+        if completions:
+            texto = f"{completions} tarefas completas hoje"
+            largura = int(draw.textlength(texto, font=self.small))
+            draw.text((w - largura - 14, 13), texto, font=self.small,
+                      fill=(235, 235, 235, 255))
+
+        if slow:
+            aviso = "desempenho baixo — feche outros aplicativos"
+            largura = int(draw.textlength(aviso, font=self.small))
+            draw.text(((w - largura) // 2, 13), aviso, font=self.small,
+                      fill=(235, 170, 60, 255))
+
+        if celebrating:
+            self._centro(draw, w, h, "Conseguiu!", (90, 220, 120, 230))
+        elif not connected:
+            self._centro(draw, w, h, "Coloque o óculos para pilotar o robô",
+                         (0, 0, 0, 190))
         return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    def _centro(self, draw, w, h, texto, fundo):
+        largura = int(draw.textlength(texto, font=self.font))
+        pad = 26
+        x0, y0 = (w - largura) // 2 - pad, h // 2 - 34
+        draw.rectangle([(x0, y0), (x0 + largura + 2 * pad, y0 + 68)], fill=fundo)
+        draw.text((x0 + pad, y0 + 20), texto, font=self.font,
+                  fill=(255, 255, 255, 255))
 
 
 def send_popup_message(headset: WebRTCHeadset, message: str, duration: float = 3.0):
@@ -413,14 +841,24 @@ def boxify_collision_meshes(model, include_arm_links: bool) -> int:
 
 
 def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
-    return env._physics.render(height=height, width=width, camera_id=camera_id)
+    """Frame contíguo da câmera pedida.
+
+    O render do dm_control devolve uma view espelhada verticalmente, com stride
+    negativo (-3840). O OpenCV não aceita stride negativo e falha com "Layout of
+    the output array img is incompatible with cv::Mat" — o array é gravável, o
+    problema é o layout. Normalizar aqui, e não em cada chamador, garante que
+    qualquer overlay possa ser desenhado sobre o resultado.
+    """
+    frame = env._physics.render(height=height, width=width, camera_id=camera_id)
+    return np.ascontiguousarray(frame)
 
 
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
              fovy: float, multiccd: bool, substeps: int, collision: str,
              anchored: bool, spectator_camera: str, idle_reset: float,
-             hole_margin: float):
+             hole_margin: float, success_reset: float, motion_scale: float,
+             socket_mass: float):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -434,6 +872,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
         sim_env_module.SIM_PHYSICS_ENV_STEP_RATIO = substeps
 
     # cameras=[] : get_obs() não renderiza nada, nós cuidamos disso no loop.
+    success_spec = SUCCESS_SPECS.get(task_name)
     print(f"Carregando ambiente '{task_name}'...")
     env = make_sim_env(task_name, cameras=[])
 
@@ -456,8 +895,19 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     if not multiccd:
         model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
 
-    if hole_margin > 0 and widen_needle_hole(model, hole_margin / 1000.0):
-        print(f"cena: vão da parede alargado em {hole_margin:.0f} mm por borda")
+    if hole_margin > 0:
+        alargou = (widen_needle_hole(model, hole_margin / 1000.0)
+                   or widen_peg_hole(model, hole_margin / 1000.0))
+        if alargou:
+            print(f"cena: encaixe alargado em {hole_margin:.0f} mm por borda")
+    markers = (success_spec or {}).get("disable_markers", ())
+    if markers and disable_marker_collision(model, markers):
+        print(f"cena: colisão do marcador desligada ({', '.join(markers)}) — "
+              "era ele que travava o encaixe")
+
+    if socket_mass > 0 and task_name == "sim_insert_peg":
+        if set_socket_mass(model, "hole", socket_mass):
+            print(f"cena: alvo do encaixe com {socket_mass:.0f} g")
 
     if collision != "mesh":
         n = boxify_collision_meshes(model, include_arm_links=(collision == "all"))
@@ -483,9 +933,13 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     # pc parariam de disparar depois de um restart, que troca o pc inteiro.
     watchdog = ConnectionWatchdog(headset)
     overlay = Overlay()
+    hud = HeadsetText()
+    if success_spec is None:
+        print(f"aviso: sem detecção de sucesso para '{task_name}'")
     instruction = TASK_INSTRUCTIONS.get(task_name, "Use os controles para mover os braços")
 
-    headset_control = AnchoredControl() if anchored else HeadsetControl()
+    headset_control = (AnchoredControl(motion_scale=motion_scale)
+                       if anchored else HeadsetControl())
     headset_control.reset()
 
     ts, action = reset_scene(env, headset_control)
@@ -497,6 +951,13 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     hold_reset_start = None
     hold_reset_fired = False
     HOLD_RESET_SECONDS = 1.5
+    CARD_SECONDS = 10.0
+    completions = 0
+    was_completed = False
+    success_at = None
+    session_started_at = None
+    slow_windows = 0
+    running_slow = False
     last_data_at = time.time()
     scene_is_fresh = True
     fps_frame0 = 0
@@ -529,9 +990,13 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 print("[sessão] novo usuário conectado, cena reiniciada")
                 ts, action = reset_scene(env, headset_control)
                 scene_is_fresh = True
+                session_started_at = time.time()
+                success_at = None
+                was_completed = False
 
             headset_data = headset.receive_data()
             feedback = HeadsetFeedback()
+            hold_progress = None
 
             if headset_data is not None:
                 last_data_at = time.time()
@@ -557,17 +1022,21 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                         ts, action = reset_scene(env, headset_control)
                         scene_is_fresh = True
                         hold_reset_fired = True
+                        was_completed = False
+                        success_at = None
                         feedback.info = "Reiniciado!"
                         headset.send_feedback(feedback)
                         continue
                     elif not hold_reset_fired:
-                        remaining = HOLD_RESET_SECONDS - held_for
-                        feedback.info = f"Segurando X para reiniciar... {remaining:.1f}s"
+                        hold_progress = held_for / HOLD_RESET_SECONDS
                 else:
                     hold_reset_start = None
                     hold_reset_fired = False
 
                 if not headset_control.is_running() and headset_data.r_button_one:
+                    # Apertar A é o sinal de "entendi": some com o cartão de
+                    # controles sem prender quem já sabe pelos 10 s inteiros.
+                    session_started_at = None
                     if anchored:
                         headset_control.start(
                             headset_data, ts["poses"]["left"],
@@ -597,17 +1066,74 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 ts, action = reset_scene(env, headset_control)
                 scene_is_fresh = True
 
-            if not feedback.info:  # não sobrescreve o aviso de "segurando X..."
-                feedback.info = (
-                    instruction if headset_control.is_running()
-                    else f"Segure A para começar\n{instruction}"
-                )
+            # Sucesso: só na borda de subida, senão comemora todo frame.
+            completed_now = task_completed(env._physics, success_spec)
+            if completed_now and not was_completed:
+                completions += 1
+                success_at = time.time()
+                play_success_sound()
+                print(f"[sessão] tarefa concluída ({completions} hoje)")
+            was_completed = completed_now
+
+            celebrating = success_at is not None and time.time() - success_at < 6.0
+            if (success_reset > 0 and success_at is not None
+                    and time.time() - success_at >= success_reset):
+                print("[sessão] reiniciando após o sucesso")
+                ts, action = reset_scene(env, headset_control)
+                scene_is_fresh = True
+                success_at = None
+                was_completed = False
+                continue
+
+            # O app desenha feedback.info no próprio infoText (WebRTCStreamer.cs:155),
+            # o que duplicava a instrução: uma na UI do app e outra no vídeo. A do
+            # vídeo é a que controlamos (posição, tamanho, acentos), então esta
+            # fica vazia de propósito.
+            feedback.info = ""
             headset.send_feedback(feedback)
 
-            # vídeo estéreo pro Quest
-            left_img = render(env, EYE_CAMERAS[0], eye_width, eye_height)
-            right_img = render(env, EYE_CAMERAS[1], eye_width, eye_height)
-            headset.send_images(left_img, right_img)
+            # Sem ninguém conectado não há para quem renderizar os olhos. São
+            # ~25 ms por frame que, num MacBook Air sem ventoinha e 8 h de
+            # evento, viram calor que degrada quem vem no próximo grupo.
+            if watchdog.connected:
+                left_img = render(env, EYE_CAMERAS[0], eye_width, eye_height)
+                right_img = render(env, EYE_CAMERAS[1], eye_width, eye_height)
+
+                showing_card = (session_started_at is not None
+                                and time.time() - session_started_at < CARD_SECONDS)
+                card = hud.table_sprite(CONTROL_TABLE_HEADERS, CONTROL_TABLE_ROWS)
+                for eye, cam in zip((left_img, right_img), EYE_CAMERAS):
+                    # Instrução e parabéns ficam presos ao mundo, "pintados" ao
+                    # fundo da bancada: texto colado na tela acompanha a cabeça
+                    # enquanto a cena se move, e é esse conflito que enjoa.
+                    hud.draw_in_world(
+                        eye, model, env._physics.data, cam,
+                        ["Segure para reiniciar"] if hold_progress is not None
+                        else [instruction],
+                        WORLD_TEXT_ANCHOR,
+                    )
+                    # O parabéns é a exceção que fica preso à tela: quem acabou
+                    # de encaixar está olhando para a mesa, e ancorado no mundo
+                    # ele ficaria fora de vista justo na hora que importa. Dura
+                    # poucos segundos, então não é o tipo de elemento estático
+                    # que provoca enjoo.
+                    if celebrating:
+                        hud.draw(eye, [SUCCESS_MESSAGE], at_center=True,
+                                 color=(20, 90, 40, 200))
+                    # Estes são momentâneos, então seguir a cabeça é aceitável.
+                    if hold_progress is not None:
+                        alvo = project_to_eye(model, env._physics.data, cam,
+                                              WORLD_RING_ANCHOR,
+                                              eye.shape[1], eye.shape[0])
+                        if alvo is not None:
+                            cx, cy, depth, focal = alvo
+                            draw_hold_ring(eye, hold_progress, (cx, cy),
+                                           focal * WORLD_RING_RADIUS / depth)
+                    elif showing_card:
+                        h, w = eye.shape[:2]
+                        hud.blit(eye, card, w // 2, int(h * 0.42))
+
+                headset.send_images(left_img, right_img)
 
             # vídeo de terceira pessoa pro público (mais barato: 1 a cada N frames)
             if show_spectator_window and frame_idx % spectator_every == 0:
@@ -617,7 +1143,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 spectator_frame = overlay.draw(
                     spectator_frame, instruction,
                     "Óculos conectado" if watchdog.connected else "Aguardando óculos",
-                    watchdog.connected,
+                    watchdog.connected, completions, celebrating, running_slow,
                 )
                 cv2.imshow(SPECTATOR_WINDOW_NAME, spectator_frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -625,8 +1151,22 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
 
             frame_idx += 1
             if time.time() - fps_t0 >= 3.0:
+                hz = (frame_idx - fps_frame0) / 3.0
+                alvo = 1 / frame_period
                 print(f"[perf] {frame_idx - fps_frame0} frames em 3s -> "
-                      f"{(frame_idx - fps_frame0)/3.0:.1f} Hz (alvo {1/frame_period:.0f})")
+                      f"{hz:.1f} Hz (alvo {alvo:.0f})")
+                # Só conta quando há alguém conectado: em repouso pulamos os
+                # renders de propósito e a taxa cai por decisão nossa.
+                if watchdog.connected and hz < alvo * 0.6:
+                    slow_windows += 1
+                else:
+                    slow_windows = 0
+                if slow_windows == 2 and not running_slow:
+                    running_slow = True
+                    print("[perf] desempenho baixo sustentado — algum outro "
+                          "aplicativo disputando CPU/GPU?")
+                elif slow_windows == 0:
+                    running_slow = False
                 fps_t0, fps_frame0 = time.time(), frame_idx
 
             time_until_next_step = frame_period - (time.time() - step_start)
@@ -653,16 +1193,28 @@ if __name__ == "__main__":
     parser.add_argument("--eye-width", type=int, default=1280,
                         help="Largura de cada olho (padrão 1280 = resolução nativa do painel do app)")
     parser.add_argument("--eye-height", type=int, default=720, help="Altura de cada olho")
-    parser.add_argument("--spectator-every", type=int, default=3,
+    parser.add_argument("--spectator-every", type=int, default=5,
                         help="Renderiza a janela do público 1 a cada N frames")
     parser.add_argument("--physics-timestep", type=float, default=0.0025,
                         help="Timestep da física. 0.002=fiel mas 0.4x tempo real aqui; "
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
-    parser.add_argument("--fovy", type=float, default=52.0,
-                        help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
-    parser.add_argument("--hole-margin", type=float, default=5.0,
-                        help="Milímetros a afastar cada borda do vão em sim_sew_needle "
-                             "(0 mantém o original, que é apertado demais para a demo)")
+    parser.add_argument("--fovy", type=float, default=70.0,
+                        help="FOV vertical dos olhos. 52 é a geometria exata do painel do app; 70 abre o campo de visão e foi o valor validado no headset")
+    parser.add_argument("--socket-mass", type=float, default=160.0,
+                        help="Massa em gramas do alvo do encaixe. O original tem 101 g "
+                             "e foge ao ser tocado; peso demais deixa a cena travada. "
+                             "0 mantém o valor original")
+    parser.add_argument("--motion-scale", type=float, default=1.0,
+                        help="Multiplica o deslocamento das mãos (1.5 = mover a mão "
+                             "10 cm move o braço 15 cm). Ajuda a alcançar sem esticar "
+                             "o braço, ao custo de precisão fina. A cabeça segue 1:1")
+    parser.add_argument("--success-reset", type=float, default=15.0,
+                        help="Segundos após concluir a tarefa até reiniciar a cena "
+                             "(0 mantém a cena como ficou)")
+    parser.add_argument("--hole-margin", type=float, default=3.0,
+                        help="Milímetros a afastar cada borda do encaixe (furo do "
+                             "insert_peg ou vão da parede do sew_needle). 0 mantém a "
+                             "geometria original, apertada demais para dois minutos")
     parser.add_argument("--idle-reset", type=float, default=25.0,
                         help="Segundos sem receber pose até reiniciar a cena "
                              "para o próximo usuário (0 desativa)")
@@ -685,4 +1237,5 @@ if __name__ == "__main__":
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
              args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored,
-             args.spectator_camera, args.idle_reset, args.hole_margin)
+             args.spectator_camera, args.idle_reset, args.hole_margin,
+             args.success_reset, args.motion_scale, args.socket_mass)
