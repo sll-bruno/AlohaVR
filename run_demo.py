@@ -24,6 +24,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -80,21 +81,30 @@ TASK_INSTRUCTIONS = {
 # get_reward() só checa se o par aparece na lista, sem olhar distância — ele
 # retorna "sucesso" com a peça a 26 cm do furo. Aqui filtramos por penetração
 # real (dist < 0).
-SUCCESS_CONTACTS = {
-    "sim_insert_peg": ("peg", "pin"),
-    "sim_sew_needle": ("pin-needle", "pin-wall"),
+# "pair" confirma alinhamento lateral (a peça está dentro do furo); "seat"
+# exige profundidade. Sem o segundo, encostar a ponta já contava como sucesso:
+# o contato reporta sempre -2 cm, que é a penetração lateral, não o quanto
+# entrou — a profundidade só sai da geometria dos corpos.
+SUCCESS_SPECS = {
+    "sim_insert_peg": {
+        "pair": ("peg", "pin"),
+        "seat": {"moving": "peg", "socket": "hole", "max_offset": 0.05},
+    },
+    "sim_sew_needle": {"pair": ("pin-needle", "pin-wall")},
 }
 # afplay e os sons são nativos do macOS: nada para instalar nem versionar.
 # O áudio sai só nas caixas do Mac — o app Unity ignora tracks que não sejam
 # de vídeo (OnTrack filtra TrackKind.Video), então não há como levá-lo ao
 # headset sem recompilar o APK. Serve de sinal para a plateia e o monitor.
 SUCCESS_SOUND = "/System/Library/Sounds/Hero.aiff"
-CONTROL_CARD = (
-    "A  assumir o controle",
-    "Gatilhos  abrir e fechar as garras",
-    "Segurar X  recomeçar",
-    "B  voltar ao início",
+CONTROL_TABLE_HEADERS = ("Controle", "Ação")
+CONTROL_TABLE_ROWS = (
+    ("Segure A", "assumir o controle do robô"),
+    ("Gatilhos", "abrir e fechar as garras"),
+    ("Segure X", "recomeçar do zero"),
+    ("B", "voltar à tela inicial"),
 )
+SUCCESS_MESSAGE = "Parabéns! Você concluiu a tarefa"
 FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/Library/Fonts/Arial Unicode.ttf",
@@ -113,9 +123,15 @@ class AnchoredControl:
     movimento passa a ser puramente incremental a partir dali.
     """
 
-    def __init__(self, head_position_threshold=0.05, head_rotation_threshold=0.3):
+    def __init__(self, head_position_threshold=0.05, head_rotation_threshold=0.3,
+                 motion_scale=1.0):
         self.head_position_threshold = head_position_threshold
         self.head_rotation_threshold = head_rotation_threshold
+        # Amplia o deslocamento das mãos (não o da cabeça, que precisa ser 1:1
+        # para a imagem não brigar com o sistema vestibular). Com 1.5, mover a
+        # mão 10 cm move o braço 15 cm: cobre mais espaço de trabalho sem exigir
+        # que a pessoa estique tanto o braço, ao custo de precisão fina.
+        self.motion_scale = motion_scale
         self.reset()
 
     def reset(self):
@@ -162,10 +178,15 @@ class AnchoredControl:
         }
 
         if self.started:
-            targets = {
-                name: transform_coordinates(user_now[name], *self.anchors[name])
-                for name in current
-            }
+            targets = {}
+            for name in current:
+                user_start, arm_start = self.anchors[name]
+                alvo = transform_coordinates(user_now[name], user_start, arm_start)
+                if name != "middle" and self.motion_scale != 1.0:
+                    deslocamento = alvo[:3, 3] - arm_start[:3, 3]
+                    alvo = alvo.copy()
+                    alvo[:3, 3] = arm_start[:3, 3] + deslocamento * self.motion_scale
+                targets[name] = alvo
             head_ref, middle_ref = self.anchors["middle"]
         else:
             # Antes de engatar o robô fica parado: alvo é a pose atual.
@@ -196,6 +217,56 @@ class AnchoredControl:
             setattr(feedback, f"{name}_arm_rotation", quat)
 
         return np.concatenate(parts), feedback
+
+
+def widen_peg_hole(model, margin: float) -> bool:
+    """Afasta as quatro placas que formam o tubo da cena sim_insert_peg.
+
+    A abertura é de 3,6 x 3,6 cm para uma peça de 2 x 2 cm — 8 mm de folga por
+    lado. Acertar 8 mm com a latência da demo, segurando os dois objetos no ar,
+    é o que trava quem tem dois minutos: as garras chegam perto e a peça não
+    entra. Só as placas se movem; o `pin`, que marca o sucesso, fica no centro
+    e não é tocado.
+    """
+    # (geom, eixo em que se afasta, sentido, eixo em que precisa crescer)
+    placas = (("hole-1", 2, -1, 1), ("hole-2", 2, +1, 1),   # piso e teto
+              ("hole-3", 1, +1, 2), ("hole-4", 1, -1, 2))   # laterais
+    try:
+        ids = {n: model.name2id(n, "geom") for n, _, _, _ in placas}
+    except Exception:
+        return False
+    for nome, eixo, sentido, eixo_cresce in placas:
+        i = ids[nome]
+        pos = np.array(model.geom_pos[i])
+        size = np.array(model.geom_size[i])
+        pos[eixo] += sentido * margin
+        # As placas se encostavam exatamente nos cantos; afastá-las sem crescer
+        # abre uma fenda visível do tamanho da margem. Crescer na direção
+        # perpendicular mantém o tubo fechado.
+        size[eixo_cresce] += margin
+        model.geom_pos[i], model.geom_size[i] = pos, size
+    return True
+
+
+def set_socket_mass(model, body_name: str, grams: float) -> bool:
+    """Ajusta a massa do alvo do encaixe.
+
+    O bloco azul tem 101 g de origem contra 48 g da peça: encostar nele o
+    empurra, e a pessoa passa a perseguir um alvo móvel enquanto mira. Pesar
+    mais o deixa firme na mesa — mas peso demais faz a cena parecer travada,
+    então é um número para calibrar, não para maximizar.
+    """
+    try:
+        body = model.name2id(body_name, "body")
+    except Exception:
+        return False
+    atual = float(model.body_mass[body])
+    if atual <= 0:
+        return False
+    alvo = grams / 1000.0
+    model.body_inertia[body] = np.array(model.body_inertia[body]) * (alvo / atual)
+    model.body_mass[body] = alvo
+    return True
 
 
 def widen_needle_hole(model, margin: float) -> bool:
@@ -243,6 +314,36 @@ def widen_needle_hole(model, margin: float) -> bool:
     return True
 
 
+# Ponto do mundo onde o texto é "pintado", atrás da bancada. Fixo no mundo:
+# um texto colado na tela acompanha a cabeça enquanto a cena se move, e esse
+# conflito é justamente o que embrulha o estômago em VR.
+# z escolhido por medição: a 0.42 o texto sai pelo topo assim que a pessoa
+# inclina a cabeça para a mesa — que é a postura natural ao manipular. A 0.28
+# ele fica entre 13% e 25% da altura do quadro nas duas posturas.
+WORLD_TEXT_ANCHOR = np.array([0.0, 0.36, 0.28])
+WORLD_TEXT_HEIGHT = 0.055   # altura física do texto, em metros
+
+
+def project_to_eye(model, data, cam_name, point, width, height):
+    """Projeta um ponto do mundo no pixel correspondente de uma câmera.
+
+    Como cada olho tem posição própria, o mesmo ponto cai em pixels diferentes
+    nos dois — é essa disparidade que faz o texto parecer estar de fato lá no
+    fundo, e não colado no rosto.
+    """
+    cam_id = model.name2id(cam_name, "camera")
+    origin = np.array(data.cam_xpos[cam_id])
+    rot = np.array(data.cam_xmat[cam_id]).reshape(3, 3)
+    local = rot.T @ (np.asarray(point, dtype=float) - origin)
+    depth = -local[2]           # a câmera do MuJoCo olha para -Z
+    if depth <= 0.05:
+        return None             # atrás da câmera ou colado nela
+    focal = (height / 2) / np.tan(np.radians(float(model.cam_fovy[cam_id])) / 2)
+    return (int(width / 2 + focal * local[0] / depth),
+            int(height / 2 - focal * local[1] / depth),
+            depth, focal)
+
+
 def draw_hold_ring(frame, progress: float):
     """Arco de progresso no centro da imagem, para o gesto de segurar X.
 
@@ -275,21 +376,21 @@ class HeadsetText:
             from PIL import ImageFont
             for path in FONT_CANDIDATES:
                 if os.path.exists(path):
-                    self.font = ImageFont.truetype(path, 30)
+                    self.font = ImageFont.truetype(path, 22)
                     break
         except ImportError:
             pass
 
-    def _sprite(self, lines):
-        key = tuple(lines)
+    def _sprite(self, lines, color=None):
+        key = (tuple(lines), color)
         if key in self._cache:
             return self._cache[key]
         from PIL import Image, ImageDraw
-        pad, line_h = 18, 40
+        pad, line_h = 14, 30
         probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         width = max(int(probe.textlength(t, font=self.font)) for t in lines) + 2 * pad
         height = line_h * len(lines) + 2 * pad
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 150))
+        img = Image.new("RGBA", (width, height), color or (0, 0, 0, 150))
         draw = ImageDraw.Draw(img)
         for i, text in enumerate(lines):
             tw = int(probe.textlength(text, font=self.font))
@@ -300,6 +401,73 @@ class HeadsetText:
             self._cache.clear()
         self._cache[key] = sprite
         return sprite
+
+    def table_sprite(self, headers, rows):
+        """Cartão de controles em duas colunas, com cabeçalho."""
+        key = ("__tabela__", headers, rows)
+        if key in self._cache:
+            return self._cache[key]
+        from PIL import Image, ImageDraw
+        pad, line_h, col_gap = 22, 34, 34
+        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        col1 = max(int(probe.textlength(t, font=self.font))
+                   for t in (headers[0], *(r[0] for r in rows)))
+        col2 = max(int(probe.textlength(t, font=self.font))
+                   for t in (headers[1], *(r[1] for r in rows)))
+        width = col1 + col_gap + col2 + 2 * pad
+        height = line_h * (len(rows) + 1) + 2 * pad + 10
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 165))
+        draw = ImageDraw.Draw(img)
+        draw.text((pad, pad), headers[0], font=self.font, fill=(150, 200, 255, 255))
+        draw.text((pad + col1 + col_gap, pad), headers[1], font=self.font,
+                  fill=(150, 200, 255, 255))
+        rule_y = pad + line_h - 6
+        draw.line([(pad, rule_y), (width - pad, rule_y)], fill=(120, 120, 120, 200))
+        for i, (controle, acao) in enumerate(rows):
+            y = pad + line_h * (i + 1) + 6
+            draw.text((pad, y), controle, font=self.font, fill=(255, 255, 255, 255))
+            draw.text((pad + col1 + col_gap, y), acao, font=self.font,
+                      fill=(235, 235, 235, 255))
+        sprite = np.array(img)
+        self._cache[key] = sprite
+        return sprite
+
+    def blit(self, frame, sprite, cx, cy, scale=1.0):
+        """Compõe um sprite centrado em (cx, cy), recortando o que sair da imagem."""
+        if scale != 1.0:
+            sh = max(1, int(sprite.shape[0] * scale))
+            sw = max(1, int(sprite.shape[1] * scale))
+            sprite = cv2.resize(sprite, (sw, sh), interpolation=cv2.INTER_AREA)
+        sh, sw = sprite.shape[:2]
+        h, w = frame.shape[:2]
+        x0, y0 = int(cx - sw / 2), int(cy - sh / 2)
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        x0, y0 = max(0, x0), max(0, y0)
+        sx1 = min(sw, sx0 + w - x0)
+        sy1 = min(sh, sy0 + h - y0)
+        if sx1 <= sx0 or sy1 <= sy0:
+            return frame
+        piece = sprite[sy0:sy1, sx0:sx1]
+        alpha = piece[:, :, 3:4].astype(np.float32) / 255.0
+        region = frame[y0:y0 + piece.shape[0], x0:x0 + piece.shape[1]]
+        frame[y0:y0 + piece.shape[0], x0:x0 + piece.shape[1]] = (
+            region * (1 - alpha) + piece[:, :, 2::-1] * alpha
+        ).astype(frame.dtype)
+        return frame
+
+    def draw_in_world(self, frame, model, data, cam_name, lines, point,
+                      world_height=WORLD_TEXT_HEIGHT, color=None):
+        """Texto ancorado num ponto do mundo, com perspectiva e paralaxe."""
+        if self.font is None or not lines:
+            return frame
+        h, w = frame.shape[:2]
+        proj = project_to_eye(model, data, cam_name, point, w, h)
+        if proj is None:
+            return frame
+        cx, cy, depth, focal = proj
+        sprite = self._sprite(tuple(lines), color)
+        alvo_px = focal * world_height * len(lines) / depth
+        return self.blit(frame, sprite, cx, cy, alvo_px / sprite.shape[0])
 
     def draw(self, frame, lines, at_center=False, y_offset=0):
         """Faixa inferior para o permanente, centro para o transitório.
@@ -313,7 +481,9 @@ class HeadsetText:
         sh, sw = sprite.shape[:2]
         h, w = frame.shape[:2]
         x = (w - sw) // 2
-        y = ((h - sh) // 2 if at_center else h - sh - int(h * 0.06)) + y_offset
+        # 14% da borda: no headset o extremo do painel cai na periferia da
+        # visão, onde ler cansa. Longe da borda, e menor, lê-se melhor.
+        y = ((h - sh) // 2 if at_center else h - sh - int(h * 0.14)) + y_offset
         if x < 0 or y < 0 or y + sh > h or x + sw > w:
             return frame
         alpha = sprite[:, :, 3:4].astype(np.float32) / 255.0
@@ -324,11 +494,13 @@ class HeadsetText:
         return frame
 
 
-def task_completed(physics, pair) -> bool:
-    """True quando os dois geoms do par se sobrepõem de verdade."""
-    if pair is None:
+def task_completed(physics, spec) -> bool:
+    """True quando a tarefa foi concluída de verdade, não só encostada."""
+    if not spec:
         return False
     data, model = physics.data, physics.model
+    alvo = set(spec["pair"])
+    tocando = False
     for i in range(data.ncon):
         contact = data.contact[i]
         if contact.dist >= 0:
@@ -337,20 +509,43 @@ def task_completed(physics, pair) -> bool:
             mujoco.mj_id2name(model._model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom1)),
             mujoco.mj_id2name(model._model, mujoco.mjtObj.mjOBJ_GEOM, int(contact.geom2)),
         }
-        if names == set(pair):
-            return True
-    return False
+        if names == alvo:
+            tocando = True
+            break
+    if not tocando:
+        return False
+
+    seat = spec.get("seat")
+    if seat is None:
+        return True
+    # Quanto a peça avançou pelo eixo do furo: a diferença entre os centros,
+    # projetada no eixo do encaixe. Perto de zero = assentada até o fundo.
+    named = physics.named.data
+    encaixe = np.array(named.xpos[seat["socket"]])
+    eixo = np.array(named.xmat[seat["socket"]]).reshape(3, 3)[:, 0]
+    desvio = abs(float(np.dot(np.array(named.xpos[seat["moving"]]) - encaixe, eixo)))
+    return desvio <= seat["max_offset"]
 
 
 def play_success_sound():
-    """Toca o som de comemoração sem bloquear o loop."""
+    """Toca o som de comemoração fora do caminho do frame.
+
+    Medido: subprocess.Popen custa ~10 ms neste processo, o que é 20% de um
+    frame e aparece como engasgo bem no momento da comemoração. Numa thread,
+    o loop nem percebe.
+    """
     if not os.path.exists(SUCCESS_SOUND):
         return
-    try:
-        subprocess.Popen(["afplay", SUCCESS_SOUND],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        pass  # sem áudio a demo continua igual
+
+    def tocar():
+        try:
+            subprocess.run(["afplay", SUCCESS_SOUND],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False)
+        except OSError:
+            pass  # sem áudio a demo continua igual
+
+    threading.Thread(target=tocar, daemon=True).start()
 
 
 def neutral_action(ts) -> np.ndarray:
@@ -603,14 +798,24 @@ def boxify_collision_meshes(model, include_arm_links: bool) -> int:
 
 
 def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
-    return env._physics.render(height=height, width=width, camera_id=camera_id)
+    """Frame contíguo da câmera pedida.
+
+    O render do dm_control devolve uma view espelhada verticalmente, com stride
+    negativo (-3840). O OpenCV não aceita stride negativo e falha com "Layout of
+    the output array img is incompatible with cv::Mat" — o array é gravável, o
+    problema é o layout. Normalizar aqui, e não em cada chamador, garante que
+    qualquer overlay possa ser desenhado sobre o resultado.
+    """
+    frame = env._physics.render(height=height, width=width, camera_id=camera_id)
+    return np.ascontiguousarray(frame)
 
 
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
              fovy: float, multiccd: bool, substeps: int, collision: str,
              anchored: bool, spectator_camera: str, idle_reset: float,
-             hole_margin: float, success_reset: float):
+             hole_margin: float, success_reset: float, motion_scale: float,
+             socket_mass: float):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -646,8 +851,14 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     if not multiccd:
         model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
 
-    if hole_margin > 0 and widen_needle_hole(model, hole_margin / 1000.0):
-        print(f"cena: vão da parede alargado em {hole_margin:.0f} mm por borda")
+    if hole_margin > 0:
+        alargou = (widen_needle_hole(model, hole_margin / 1000.0)
+                   or widen_peg_hole(model, hole_margin / 1000.0))
+        if alargou:
+            print(f"cena: encaixe alargado em {hole_margin:.0f} mm por borda")
+    if socket_mass > 0 and task_name == "sim_insert_peg":
+        if set_socket_mass(model, "hole", socket_mass):
+            print(f"cena: alvo do encaixe com {socket_mass:.0f} g")
 
     if collision != "mesh":
         n = boxify_collision_meshes(model, include_arm_links=(collision == "all"))
@@ -674,12 +885,13 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     watchdog = ConnectionWatchdog(headset)
     overlay = Overlay()
     hud = HeadsetText()
-    success_pair = SUCCESS_CONTACTS.get(task_name)
-    if success_pair is None:
+    success_spec = SUCCESS_SPECS.get(task_name)
+    if success_spec is None:
         print(f"aviso: sem detecção de sucesso para '{task_name}'")
     instruction = TASK_INSTRUCTIONS.get(task_name, "Use os controles para mover os braços")
 
-    headset_control = AnchoredControl() if anchored else HeadsetControl()
+    headset_control = (AnchoredControl(motion_scale=motion_scale)
+                       if anchored else HeadsetControl())
     headset_control.reset()
 
     ts, action = reset_scene(env, headset_control)
@@ -807,7 +1019,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 scene_is_fresh = True
 
             # Sucesso: só na borda de subida, senão comemora todo frame.
-            completed_now = task_completed(env._physics, success_pair)
+            completed_now = task_completed(env._physics, success_spec)
             if completed_now and not was_completed:
                 completions += 1
                 success_at = time.time()
@@ -815,7 +1027,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 print(f"[sessão] tarefa concluída ({completions} hoje)")
             was_completed = completed_now
 
-            celebrating = success_at is not None and time.time() - success_at < 4.0
+            celebrating = success_at is not None and time.time() - success_at < 6.0
             if (success_reset > 0 and success_at is not None
                     and time.time() - success_at >= success_reset):
                 print("[sessão] reiniciando após o sucesso")
@@ -825,12 +1037,11 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                 was_completed = False
                 continue
 
-            if not feedback.info:
-                feedback.info = (
-                    "Conseguiu!" if celebrating else
-                    instruction if headset_control.is_running()
-                    else f"Segure A para começar\n{instruction}"
-                )
+            # O app desenha feedback.info no próprio infoText (WebRTCStreamer.cs:155),
+            # o que duplicava a instrução: uma na UI do app e outra no vídeo. A do
+            # vídeo é a que controlamos (posição, tamanho, acentos), então esta
+            # fica vazia de propósito.
+            feedback.info = ""
             headset.send_feedback(feedback)
 
             # Sem ninguém conectado não há para quem renderizar os olhos. São
@@ -842,17 +1053,26 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
 
                 showing_card = (session_started_at is not None
                                 and time.time() - session_started_at < CARD_SECONDS)
-                for eye in (left_img, right_img):
+                card = hud.table_sprite(CONTROL_TABLE_HEADERS, CONTROL_TABLE_ROWS)
+                for eye, cam in zip((left_img, right_img), EYE_CAMERAS):
+                    # Instrução e parabéns ficam presos ao mundo, "pintados" ao
+                    # fundo da bancada: texto colado na tela acompanha a cabeça
+                    # enquanto a cena se move, e é esse conflito que enjoa.
+                    hud.draw_in_world(
+                        eye, model, env._physics.data, cam,
+                        [SUCCESS_MESSAGE] if celebrating else [instruction],
+                        WORLD_TEXT_ANCHOR,
+                        world_height=0.075 if celebrating else WORLD_TEXT_HEIGHT,
+                        color=(20, 90, 40, 190) if celebrating else None,
+                    )
+                    # Estes são momentâneos, então seguir a cabeça é aceitável.
                     if hold_progress is not None:
                         draw_hold_ring(eye, hold_progress)
-                        # abaixo da rodinha, senão o texto cobre o próprio anel
                         hud.draw(eye, ["Segure para reiniciar"], at_center=True,
                                  y_offset=int(eye.shape[0] * 0.16))
-                    elif celebrating:
-                        hud.draw(eye, ["Conseguiu!"], at_center=True)
                     elif showing_card:
-                        hud.draw(eye, CONTROL_CARD, at_center=True)
-                    hud.draw(eye, [instruction])
+                        h, w = eye.shape[:2]
+                        hud.blit(eye, card, w // 2, int(h * 0.42))
 
                 headset.send_images(left_img, right_img)
 
@@ -921,12 +1141,21 @@ if __name__ == "__main__":
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=70.0,
                         help="FOV vertical dos olhos. 52 é a geometria exata do painel do app; 70 abre o campo de visão e foi o valor validado no headset")
+    parser.add_argument("--socket-mass", type=float, default=160.0,
+                        help="Massa em gramas do alvo do encaixe. O original tem 101 g "
+                             "e foge ao ser tocado; peso demais deixa a cena travada. "
+                             "0 mantém o valor original")
+    parser.add_argument("--motion-scale", type=float, default=1.0,
+                        help="Multiplica o deslocamento das mãos (1.5 = mover a mão "
+                             "10 cm move o braço 15 cm). Ajuda a alcançar sem esticar "
+                             "o braço, ao custo de precisão fina. A cabeça segue 1:1")
     parser.add_argument("--success-reset", type=float, default=15.0,
                         help="Segundos após concluir a tarefa até reiniciar a cena "
                              "(0 mantém a cena como ficou)")
-    parser.add_argument("--hole-margin", type=float, default=5.0,
-                        help="Milímetros a afastar cada borda do vão em sim_sew_needle "
-                             "(0 mantém o original, que é apertado demais para a demo)")
+    parser.add_argument("--hole-margin", type=float, default=3.0,
+                        help="Milímetros a afastar cada borda do encaixe (furo do "
+                             "insert_peg ou vão da parede do sew_needle). 0 mantém a "
+                             "geometria original, apertada demais para dois minutos")
     parser.add_argument("--idle-reset", type=float, default=25.0,
                         help="Segundos sem receber pose até reiniciar a cena "
                              "para o próximo usuário (0 desativa)")
@@ -950,4 +1179,4 @@ if __name__ == "__main__":
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
              args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored,
              args.spectator_camera, args.idle_reset, args.hole_margin,
-             args.success_reset)
+             args.success_reset, args.motion_scale, args.socket_mass)
