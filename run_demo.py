@@ -85,10 +85,16 @@ TASK_INSTRUCTIONS = {
 # exige profundidade. Sem o segundo, encostar a ponta já contava como sucesso:
 # o contato reporta sempre -2 cm, que é a penetração lateral, não o quanto
 # entrou — a profundidade só sai da geometria dos corpos.
+# O `pin` do insert_peg tem a MESMA seção da peça (2x2 cm) e fica atravessado no
+# meio do tubo: medido, a peça começa a penetrá-lo a 2 cm de profundidade e trava
+# ali. Ele deveria ser só sensor (gap="100" no XML), mas na prática barra. Por
+# isso a colisão dele é desligada e o sucesso passa a sair da geometria dos
+# corpos, sem depender de contato nenhum.
 SUCCESS_SPECS = {
     "sim_insert_peg": {
-        "pair": ("peg", "pin"),
-        "seat": {"moving": "peg", "socket": "hole", "max_offset": 0.05},
+        "geometric": {"moving": "peg", "socket": "hole",
+                      "max_offset": 0.05, "max_lateral": 0.02},
+        "disable_markers": ("pin",),
     },
     "sim_sew_needle": {"pair": ("pin-needle", "pin-wall")},
 }
@@ -321,6 +327,10 @@ def widen_needle_hole(model, margin: float) -> bool:
 # inclina a cabeça para a mesa — que é a postura natural ao manipular. A 0.28
 # ele fica entre 13% e 25% da altura do quadro nas duas posturas.
 WORLD_TEXT_ANCHOR = np.array([0.0, 0.36, 0.28])
+# A rodinha fica logo acima da mensagem, no mesmo plano do mundo. 7 cm por
+# medição: abaixo disso o anel encosta no texto (a 5 cm sobram 6 px).
+WORLD_RING_ANCHOR = WORLD_TEXT_ANCHOR + np.array([0.0, 0.0, 0.07])
+WORLD_RING_RADIUS = 0.045   # raio físico, em metros
 WORLD_TEXT_HEIGHT = 0.055   # altura física do texto, em metros
 
 
@@ -344,16 +354,21 @@ def project_to_eye(model, data, cam_name, point, width, height):
             depth, focal)
 
 
-def draw_hold_ring(frame, progress: float):
-    """Arco de progresso no centro da imagem, para o gesto de segurar X.
+def draw_hold_ring(frame, progress: float, center=None, radius=None):
+    """Arco de progresso do gesto de segurar X.
 
     Sem isto o gesto é invisível: quem segura não tem sinal de que está
-    acontecendo algo e conclui que o botão não funciona. Desenhado na mesma
-    coordenada nos dois olhos, aparece na profundidade do painel.
+    acontecendo algo e conclui que o botão não funciona. Recebe centro e raio já
+    projetados para ficar ancorado no mundo, junto da mensagem fixa — preso à
+    tela ele acompanharia a cabeça, que é o que embrulha o estômago.
     """
     h, w = frame.shape[:2]
-    center = (w // 2, h // 2)
-    radius = int(min(h, w) * 0.09)
+    if center is None:
+        center = (w // 2, h // 2)
+    if radius is None:
+        radius = int(min(h, w) * 0.09)
+    center = (int(center[0]), int(center[1]))
+    radius = max(6, int(radius))
     cv2.circle(frame, center, radius, (60, 60, 60), 6, cv2.LINE_AA)
     cv2.ellipse(frame, center, (radius, radius), -90, 0,
                 360 * max(0.0, min(1.0, progress)), (90, 220, 120), 6, cv2.LINE_AA)
@@ -494,11 +509,39 @@ class HeadsetText:
         return frame
 
 
+def disable_marker_collision(model, names) -> int:
+    """Tira os marcadores de sucesso do caminho da física."""
+    desligados = 0
+    for nome in names:
+        try:
+            i = model.name2id(nome, "geom")
+        except Exception:
+            continue
+        model.geom_contype[i] = 0
+        model.geom_conaffinity[i] = 0
+        desligados += 1
+    return desligados
+
+
 def task_completed(physics, spec) -> bool:
     """True quando a tarefa foi concluída de verdade, não só encostada."""
     if not spec:
         return False
     data, model = physics.data, physics.model
+
+    geo = spec.get("geometric")
+    if geo is not None:
+        # Sem contato: a peça está encaixada quando o eixo dela coincide com o
+        # do encaixe (alinhamento) e os centros estão próximos (profundidade).
+        named = physics.named.data
+        centro = np.array(named.xpos[geo["socket"]])
+        eixo = np.array(named.xmat[geo["socket"]]).reshape(3, 3)[:, 0]
+        delta = np.array(named.xpos[geo["moving"]]) - centro
+        ao_longo = float(np.dot(delta, eixo))
+        lateral = float(np.linalg.norm(delta - ao_longo * eixo))
+        return (abs(ao_longo) <= geo["max_offset"]
+                and lateral <= geo["max_lateral"])
+
     alvo = set(spec["pair"])
     tocando = False
     for i in range(data.ncon):
@@ -829,6 +872,7 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
         sim_env_module.SIM_PHYSICS_ENV_STEP_RATIO = substeps
 
     # cameras=[] : get_obs() não renderiza nada, nós cuidamos disso no loop.
+    success_spec = SUCCESS_SPECS.get(task_name)
     print(f"Carregando ambiente '{task_name}'...")
     env = make_sim_env(task_name, cameras=[])
 
@@ -856,6 +900,11 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                    or widen_peg_hole(model, hole_margin / 1000.0))
         if alargou:
             print(f"cena: encaixe alargado em {hole_margin:.0f} mm por borda")
+    markers = (success_spec or {}).get("disable_markers", ())
+    if markers and disable_marker_collision(model, markers):
+        print(f"cena: colisão do marcador desligada ({', '.join(markers)}) — "
+              "era ele que travava o encaixe")
+
     if socket_mass > 0 and task_name == "sim_insert_peg":
         if set_socket_mass(model, "hole", socket_mass):
             print(f"cena: alvo do encaixe com {socket_mass:.0f} g")
@@ -885,7 +934,6 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     watchdog = ConnectionWatchdog(headset)
     overlay = Overlay()
     hud = HeadsetText()
-    success_spec = SUCCESS_SPECS.get(task_name)
     if success_spec is None:
         print(f"aviso: sem detecção de sucesso para '{task_name}'")
     instruction = TASK_INSTRUCTIONS.get(task_name, "Use os controles para mover os braços")
@@ -1060,16 +1108,22 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                     # enquanto a cena se move, e é esse conflito que enjoa.
                     hud.draw_in_world(
                         eye, model, env._physics.data, cam,
-                        [SUCCESS_MESSAGE] if celebrating else [instruction],
+                        [SUCCESS_MESSAGE] if celebrating
+                        else ["Segure para reiniciar"] if hold_progress is not None
+                        else [instruction],
                         WORLD_TEXT_ANCHOR,
                         world_height=0.075 if celebrating else WORLD_TEXT_HEIGHT,
                         color=(20, 90, 40, 190) if celebrating else None,
                     )
                     # Estes são momentâneos, então seguir a cabeça é aceitável.
                     if hold_progress is not None:
-                        draw_hold_ring(eye, hold_progress)
-                        hud.draw(eye, ["Segure para reiniciar"], at_center=True,
-                                 y_offset=int(eye.shape[0] * 0.16))
+                        alvo = project_to_eye(model, env._physics.data, cam,
+                                              WORLD_RING_ANCHOR,
+                                              eye.shape[1], eye.shape[0])
+                        if alvo is not None:
+                            cx, cy, depth, focal = alvo
+                            draw_hold_ring(eye, hold_progress, (cx, cy),
+                                           focal * WORLD_RING_RADIUS / depth)
                     elif showing_card:
                         h, w = eye.shape[:2]
                         hud.blit(eye, card, w // 2, int(h * 0.42))
