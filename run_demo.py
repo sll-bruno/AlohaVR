@@ -484,7 +484,7 @@ class HeadsetText:
         alvo_px = focal * world_height * len(lines) / depth
         return self.blit(frame, sprite, cx, cy, alvo_px / sprite.shape[0])
 
-    def draw(self, frame, lines, at_center=False, y_offset=0):
+    def draw(self, frame, lines, at_center=False, y_offset=0, color=None):
         """Faixa inferior para o permanente, centro para o transitório.
 
         O painel do app ocupa 81,9° x 52°, então o extremo da imagem é
@@ -492,7 +492,7 @@ class HeadsetText:
         """
         if self.font is None or not lines:
             return frame
-        sprite = self._sprite(tuple(lines))
+        sprite = self._sprite(tuple(lines), color)
         sh, sw = sprite.shape[:2]
         h, w = frame.shape[:2]
         x = (w - sw) // 2
@@ -1108,13 +1108,18 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                     # enquanto a cena se move, e é esse conflito que enjoa.
                     hud.draw_in_world(
                         eye, model, env._physics.data, cam,
-                        [SUCCESS_MESSAGE] if celebrating
-                        else ["Segure para reiniciar"] if hold_progress is not None
+                        ["Segure para reiniciar"] if hold_progress is not None
                         else [instruction],
                         WORLD_TEXT_ANCHOR,
-                        world_height=0.075 if celebrating else WORLD_TEXT_HEIGHT,
-                        color=(20, 90, 40, 190) if celebrating else None,
                     )
+                    # O parabéns é a exceção que fica preso à tela: quem acabou
+                    # de encaixar está olhando para a mesa, e ancorado no mundo
+                    # ele ficaria fora de vista justo na hora que importa. Dura
+                    # poucos segundos, então não é o tipo de elemento estático
+                    # que provoca enjoo.
+                    if celebrating:
+                        hud.draw(eye, [SUCCESS_MESSAGE], at_center=True,
+                                 color=(20, 90, 40, 200))
                     # Estes são momentâneos, então seguir a cabeça é aceitável.
                     if hold_progress is not None:
                         alvo = project_to_eye(model, env._physics.data, cam,
