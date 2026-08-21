@@ -157,13 +157,15 @@ Pensado para grupos rotativos, monitores treinados numa única sessão e ningué
 
 | Situação | O que acontece |
 |---|---|
-| Novo óculos conecta | Cena reinicia automaticamente |
-| Alguém aperta **B** | Cena reinicia |
-| Óculos sem uso por 25 s (`--idle-reset`) | Cena reinicia |
+| Novo óculos conecta (voltou pra tela inicial e apertou Connect de novo) | Cena reinicia automaticamente |
+| Segurar **X** (esquerdo) por ~1,5 s | Cena reinicia por completo, incluindo a referência de cabeça/mãos |
 | Física diverge | Cena reinicia, processo continua |
-| Óculos desconecta | Offer é republicado; o próximo conecta sozinho |
+| Conexão cai de verdade (app fecha, sai da cena, crash) | Offer é republicado; o próximo conecta sozinho |
+| Pose para de chegar por >25 s (`--idle-reset`) | Cena reinicia — rede de segurança, não o caminho principal |
 
-Esse último item é o mais importante e não é comportamento do projeto original: o `WebRTCHeadset` do av-aloha só se recupera de `iceConnectionState == "closed"`, estado que no aiortc só ocorre quando a conexão é fechada localmente. Quando alguém tira o óculos, o estado vai para `failed`, o offer nunca volta ao Firestore (que já foi apagado após a primeira conexão) e **o usuário seguinte não conseguiria conectar** sem reiniciar o processo. O `ConnectionWatchdog` cobre isso.
+**Importante, testado ao vivo com o headset real:** só tirar o óculos da cabeça e recolocar **não reinicia nada**. O `WebRTCStreamer.cs` só derruba a conexão no `OnDestroy()` — ou seja, quando o app sai da cena de teleop de volta pra tela inicial — e não tem nenhum handler de `OnApplicationPause`. A tela apaga porque o próprio sistema do Quest apaga o display quando ninguém está com o headset no rosto, mas o app continua rodando e a pose dos controles continua chegando o tempo todo. **A troca limpa entre alunos é o `hold X`**, não tirar/recolocar o headset.
+
+O caso de a conexão cair de verdade (item da tabela acima) também não é comportamento do projeto original: o `WebRTCHeadset` do av-aloha só se recupera de `iceConnectionState == "closed"`. Testado ao vivo: o app *dispara* isso sozinho ao sair da cena — mas se algum dia isso falhar (ex: queda de Wi-Fi sem fechamento limpo), o `ConnectionWatchdog` assume, verificando se o mecanismo original já resolveu (por identidade do objeto de conexão) antes de agir, pra não derrubar uma sessão que acabou de ficar boa.
 
 **Tela do público:** legenda com a tarefa e um indicador de conexão (amarelo = aguardando óculos, verde = conectado), para o monitor saber o estado sem olhar o terminal.
 

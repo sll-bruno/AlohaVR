@@ -176,6 +176,51 @@ class AnchoredControl:
         return np.concatenate(parts), feedback
 
 
+def widen_needle_hole(model, margin: float) -> bool:
+    """Afasta as bordas do vão da parede na cena sim_sew_needle.
+
+    A parede é montada com caixas: dois pilares laterais (wall-2/3) e dois
+    blocos centrais, embaixo e em cima (wall-4/5). O vão entre eles é de 3x3 cm
+    e a agulha tem 2x2 cm — 5 mm de folga de cada lado, o que com a latência da
+    demo torna a tarefa quase impossível para quem tem dois minutos.
+
+    Só as bordas se movem: os marcadores pin-wall/pin-needle, que é o que o
+    get_reward() usa para detectar a agulha enfiada, ficam no centro do vão e
+    não são tocados.
+    """
+    try:
+        ids = {n: model.name2id(n, "geom") for n in
+               ("wall-2", "wall-3", "wall-4", "wall-5")}
+    except Exception:
+        return False  # cena sem parede: nada a fazer
+
+    # Pilares recuam em y, mantendo a borda externa no lugar.
+    for name, side in (("wall-2", +1), ("wall-3", -1)):
+        i = ids[name]
+        pos, size = np.array(model.geom_pos[i]), np.array(model.geom_size[i])
+        outer = side * pos[1] + size[1]
+        inner = side * pos[1] - size[1] + margin
+        size[1] = (outer - inner) / 2
+        pos[1] = side * (inner + size[1])
+        model.geom_pos[i], model.geom_size[i] = pos, size
+
+    # Blocos centrais acompanham a nova largura e recuam em z, cada um afastando
+    # a face voltada para o vão e mantendo a outra.
+    for name, moves_top in (("wall-4", True), ("wall-5", False)):
+        i = ids[name]
+        pos, size = np.array(model.geom_pos[i]), np.array(model.geom_size[i])
+        size[1] += margin
+        low, high = pos[2] - size[2], pos[2] + size[2]
+        if moves_top:
+            high -= margin
+        else:
+            low += margin
+        size[2] = (high - low) / 2
+        pos[2] = low + size[2]
+        model.geom_pos[i], model.geom_size[i] = pos, size
+    return True
+
+
 def neutral_action(ts) -> np.ndarray:
     """Ação que mantém cada braço onde está (garras abertas)."""
     return np.concatenate([
@@ -194,49 +239,91 @@ def reset_scene(env, headset_control):
 class ConnectionWatchdog:
     """Republica o offer quando o headset cai, para o próximo usuário conectar.
 
-    O WebRTCHeadset do av-aloha só reinicia em iceConnectionState == "closed",
-    que no aiortc acontece basicamente quando *nós* fechamos a conexão. Quando
-    alguém tira o óculos ou o app fecha, o estado vai para "failed"/"disconnected"
-    e o offer nunca volta ao Firestore — que já foi apagado após a primeira
-    conexão. Sem isto, o segundo usuário do dia não conectaria e alguém teria
-    que reiniciar o processo no computador.
+    O próprio WebRTCHeadset do av-aloha já reinicia quando o ICE fecha
+    (webrtc_headset.py, on_iceconnectionstatechange) — e na prática isso *dispara*
+    quando alguém tira o óculos, contrariando a suposição inicial de que só
+    "failed"/"disconnected" ocorreriam. O problema real, visto ao testar com o
+    headset de verdade, foi outro: com as duas lógicas de restart rodando em
+    paralelo, o watchdog às vezes derrubava uma conexão que o mecanismo original
+    tinha acabado de restabelecer ("Connection closed, restarting..." aparecia
+    de novo logo após "Data channel is open"). A correção é checar a *identidade*
+    do objeto `pc`: se ele já mudou desde que o estado morto foi observado, o
+    mecanismo original já agiu, e o watchdog não interfere.
+
+    Mantido como rede de segurança para o caso em que o ICE nunca alcança
+    "closed" de fato (ex: Wi-Fi cai sem fechamento limpo) — aí sim o watchdog é
+    a única coisa que republica o offer.
     """
 
     DEAD_STATES = ("failed", "closed", "disconnected")
 
-    def __init__(self, headset, grace_seconds=5.0):
+    def __init__(self, headset, grace_seconds=8.0):
         self.headset = headset
         self.grace_seconds = grace_seconds
         self.connected = False
         self.dead_since = None
+        self.pc_when_dead = None
         self.last_state = None
+        self.last_pc = headset.pc
 
     def poll(self) -> bool:
         """Avança a máquina de estados. True quando um novo usuário conecta."""
-        state = self.headset.pc.connectionState
+        pc = self.headset.pc
+
+        if pc is not self.last_pc:
+            # O mecanismo original trocou o objeto `pc` (fechou e recriou) mais
+            # rápido do que o nosso polling: um ciclo completo "closed" -> "new"
+            # -> "connecting" -> "connected" pode acontecer entre duas chamadas
+            # de poll(), e aí nunca observamos nenhum DEAD_STATE — self.connected
+            # ficava preso em True e a cena não era reiniciada para quem chegou
+            # depois. Identidade do objeto é um sinal confiável mesmo perdendo
+            # os estados intermediários.
+            self.last_pc = pc
+            self.connected = False
+            self.dead_since = None
+            self.pc_when_dead = None
+            self.last_state = None  # reimprime o estado do novo pc
+
+        state = pc.connectionState
         if state != self.last_state:
             print(f"[webrtc] {state}")
             self.last_state = state
 
         if state == "connected":
             self.dead_since = None
+            self.pc_when_dead = None
             if not self.connected:
                 self.connected = True
                 return True
             return False
 
         if state in self.DEAD_STATES and self.connected:
-            # Carência: "disconnected" às vezes se recupera sozinho.
+            # Carência: dá tempo do mecanismo original (iceConnectionState ==
+            # "closed") agir primeiro, e "disconnected" às vezes se recupera
+            # sozinho sem nenhum restart.
             now = time.time()
             if self.dead_since is None:
                 self.dead_since = now
+                self.pc_when_dead = pc
             elif now - self.dead_since >= self.grace_seconds:
                 self.connected = False
                 self.dead_since = None
-                print("[webrtc] headset saiu; republicando offer para o próximo usuário")
-                asyncio.run_coroutine_threadsafe(
-                    self.headset.restart_connection(), self.headset.event_loop
-                )
+                if self.headset.pc is self.pc_when_dead:
+                    # Ninguém trocou o pc ainda: o mecanismo original não agiu
+                    # (ou nunca vai agir, ex. queda de rede sem fechamento
+                    # limpo). Republica por conta própria.
+                    print("[webrtc] sem reação própria após a carência; "
+                          "republicando offer para o próximo usuário")
+                    asyncio.run_coroutine_threadsafe(
+                        self.headset.restart_connection(), self.headset.event_loop
+                    )
+                else:
+                    # O mecanismo original já trocou o pc por conta própria
+                    # (ex: "Connection closed, restarting..."). Não faz nada —
+                    # só volta a acompanhar o novo pc no próximo poll().
+                    print("[webrtc] restart original já em andamento, "
+                          "watchdog não interfere")
+                self.pc_when_dead = None
         return False
 
 
@@ -332,7 +419,8 @@ def render(env, camera_id: str, width: int, height: int) -> np.ndarray:
 def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
              eye_height: int, spectator_every: int, physics_timestep: float,
              fovy: float, multiccd: bool, substeps: int, collision: str,
-             anchored: bool, spectator_camera: str, idle_reset: float):
+             anchored: bool, spectator_camera: str, idle_reset: float,
+             hole_margin: float):
     if task_name not in SIM_TASK_CONFIGS:
         sys.exit(
             f"Task '{task_name}' não existe em SIM_TASK_CONFIGS. "
@@ -368,6 +456,9 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     if not multiccd:
         model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)
 
+    if hole_margin > 0 and widen_needle_hole(model, hole_margin / 1000.0):
+        print(f"cena: vão da parede alargado em {hole_margin:.0f} mm por borda")
+
     if collision != "mesh":
         n = boxify_collision_meshes(model, include_arm_links=(collision == "all"))
         print(f"colisão: {n} malhas convertidas em caixas (modo '{collision}')")
@@ -400,10 +491,12 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
     ts, action = reset_scene(env, headset_control)
     env.step(action)
 
-    print(f"Pronto: \"{instruction}\". A engata o controle, B reinicia a cena.")
+    print(f"Pronto: \"{instruction}\". A engata o controle, segure X para reiniciar tudo.")
 
     frame_idx = 0
-    reset_pressed = False
+    hold_reset_start = None
+    hold_reset_fired = False
+    HOLD_RESET_SECONDS = 1.5
     last_data_at = time.time()
     scene_is_fresh = True
     fps_frame0 = 0
@@ -449,16 +542,30 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                     ts["poses"]["middle"],
                 )
 
-                # B reinicia a cena. Sem isto, arrumar a bagunça de um aluno
-                # exigiria o monitor ir até o computador entre uma pessoa e outra.
-                if headset_data.r_button_two and not reset_pressed:
-                    print("[sessão] reinício pedido pelo botão B")
-                    ts, action = reset_scene(env, headset_control)
-                    scene_is_fresh = True
-                    reset_pressed = True
-                    headset.send_feedback(feedback)
-                    continue
-                reset_pressed = bool(headset_data.r_button_two)
+                # Segurar X (esquerdo) por HOLD_RESET_SECONDS reinicia tudo do
+                # zero, incluindo a referência de cabeça/mãos — reset_scene já
+                # chama headset_control.reset(), que limpa as âncoras da
+                # AnchoredControl; a próxima vez que A for apertado, a referência
+                # é recalculada na pose atual da pessoa. Toque rápido não faz
+                # nada, para evitar reinício sem querer.
+                if headset_data.l_button_one:
+                    if hold_reset_start is None:
+                        hold_reset_start = time.time()
+                    held_for = time.time() - hold_reset_start
+                    if held_for >= HOLD_RESET_SECONDS and not hold_reset_fired:
+                        print("[sessão] reinício completo pedido (X segurado)")
+                        ts, action = reset_scene(env, headset_control)
+                        scene_is_fresh = True
+                        hold_reset_fired = True
+                        feedback.info = "Reiniciado!"
+                        headset.send_feedback(feedback)
+                        continue
+                    elif not hold_reset_fired:
+                        remaining = HOLD_RESET_SECONDS - held_for
+                        feedback.info = f"Segurando X para reiniciar... {remaining:.1f}s"
+                else:
+                    hold_reset_start = None
+                    hold_reset_fired = False
 
                 if not headset_control.is_running() and headset_data.r_button_one:
                     if anchored:
@@ -478,17 +585,23 @@ def run_demo(task_name: str, show_spectator_window: bool, eye_width: int,
                     headset_control.reset()
             elif (not scene_is_fresh and idle_reset > 0
                   and time.time() - last_data_at > idle_reset):
-                # O Quest pausa o app quando ninguém o está usando, então parar de
-                # receber pose é o sinal de que o óculos foi tirado: deixa a cena
-                # pronta para a próxima pessoa.
+                # NÃO detecta "tirou o headset": o WebRTCStreamer.cs só limpa
+                # coisa nenhuma em OnDestroy (sair da PassthroughScene) — não
+                # tem OnApplicationPause. Tirar o headset da cabeça apenas apaga
+                # a tela; a pose dos controles continua chegando o tempo todo.
+                # Isto só cobre o caso de a pose realmente parar de chegar por
+                # outro motivo (app travou, processo do outro lado morreu sem
+                # fechar a conexão) — não substitui alguém voltar pela tela
+                # inicial entre um aluno e outro.
                 print(f"[sessão] {idle_reset:.0f}s sem uso, cena reiniciada")
                 ts, action = reset_scene(env, headset_control)
                 scene_is_fresh = True
 
-            feedback.info = (
-                instruction if headset_control.is_running()
-                else f"Segure A para começar\n{instruction}"
-            )
+            if not feedback.info:  # não sobrescreve o aviso de "segurando X..."
+                feedback.info = (
+                    instruction if headset_control.is_running()
+                    else f"Segure A para começar\n{instruction}"
+                )
             headset.send_feedback(feedback)
 
             # vídeo estéreo pro Quest
@@ -547,6 +660,9 @@ if __name__ == "__main__":
                              "0.004=~0.75x e estável; 0.005=tempo real porém diverge sob contato")
     parser.add_argument("--fovy", type=float, default=52.0,
                         help="FOV vertical dos olhos. 52 = ângulo real que o painel 1280x720 do app ocupa (1.73x0.98m a 1m)")
+    parser.add_argument("--hole-margin", type=float, default=5.0,
+                        help="Milímetros a afastar cada borda do vão em sim_sew_needle "
+                             "(0 mantém o original, que é apertado demais para a demo)")
     parser.add_argument("--idle-reset", type=float, default=25.0,
                         help="Segundos sem receber pose até reiniciar a cena "
                              "para o próximo usuário (0 desativa)")
@@ -569,4 +685,4 @@ if __name__ == "__main__":
 
     run_demo(args.task_name, args.spectator, args.eye_width, args.eye_height,
              args.spectator_every, args.physics_timestep, args.fovy, args.multiccd, args.substeps, args.collision, args.anchored,
-             args.spectator_camera, args.idle_reset)
+             args.spectator_camera, args.idle_reset, args.hole_margin)

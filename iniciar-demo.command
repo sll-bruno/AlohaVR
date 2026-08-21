@@ -29,7 +29,8 @@ cat <<'BANNER'
   1. Espere aparecer "Aguardando o oculos conectar"
   2. No oculos: abra o app, toque em Load, escolha o robo
      e toque em Connect
-  3. Botao A: assumir o controle   |   Botao B: reiniciar
+  3. Botao A (direito): assumir o controle
+  4. Segure X (esquerdo) por 1,5s: reiniciar a cena do zero
 ==========================================================
 BANNER
 
